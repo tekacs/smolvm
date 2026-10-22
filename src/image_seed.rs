@@ -37,9 +37,9 @@
 
 #[cfg(unix)]
 pub use imp::{
-    discard_unbooted_archive_storage, prewarm_recent_seeds, revalidate_seed, seed_root,
-    seed_storage, seed_storage_with_trust, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
-    prepare_image, prepared, SeedId, SeedSpec,
+    discard_unbooted_archive_storage, prepare_image, prepared, prewarm_recent_seeds,
+    revalidate_seed, seed_root, seed_storage, seed_storage_with_trust, seedable_image, wants_seed,
+    SeedId, SeedSpec, SEED_MACHINE_PREFIX,
 };
 
 /// The smolvm binary that builds seeds. The SDKs run inside `node` or `python`,
@@ -465,8 +465,16 @@ mod imp {
             cache,
             built,
         } = prepare_image(SeedSpec {
-            exe, image, auth, storage_gb, digest_ttl, proxy, no_proxy, trust_host_certs,
-        })?.seed;
+            exe,
+            image,
+            auth,
+            storage_gb,
+            digest_ttl,
+            proxy,
+            no_proxy,
+            trust_host_certs,
+        })?
+        .seed;
         let Some((seed, format)) = seed_disk(&key_dir) else {
             return Err(Error::config(
                 "image seed",
@@ -530,12 +538,25 @@ mod imp {
         };
         let key = seed_key(image, &digest, template.as_deref(), small_gb)?;
         preparation::ensure(seed_root(), &key, |key_dir| {
-            build_seed(exe, image, auth, &key, key_dir, proxy, no_proxy, trust_host_certs, small_gb)?;
+            build_seed(
+                exe,
+                image,
+                auth,
+                &key,
+                key_dir,
+                proxy,
+                no_proxy,
+                trust_host_certs,
+                small_gb,
+            )?;
             // Preserve authorization/digest revalidation for mutable registry tags.
             if archive_hash.is_none() && resolve()? != digest {
                 let _ = std::fs::remove_dir_all(key_dir);
                 let _ = std::fs::remove_file(digest_cache_path(image, auth));
-                return Err(Error::config("image seed", format!("{image} moved during the seed build")));
+                return Err(Error::config(
+                    "image seed",
+                    format!("{image} moved during the seed build"),
+                ));
             }
             Ok(())
         })

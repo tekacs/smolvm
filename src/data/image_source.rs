@@ -356,7 +356,11 @@ const LOCAL_ARCHIVE_PREFIX: &str = "local:";
 
 /// Address a pinned archive without staging it or reading its bytes.
 pub fn archive_reference(sha256: &str) -> Result<String> {
-    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err(Error::config("image archive", "invalid SHA256"));
     }
     Ok(format!("{LOCAL_ARCHIVE_PREFIX}{sha256}"))

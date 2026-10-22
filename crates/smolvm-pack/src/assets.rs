@@ -445,7 +445,11 @@ fn find_template(filename: &str, materialize: bool) -> Option<PathBuf> {
         let compressed = root.join(format!("{filename}.zst"));
         if compressed.exists() {
             if !materialize {
-                if let Some(path) = template_destinations(&compressed, filename).into_iter().flatten().find(|path| path.exists()) {
+                if let Some(path) = template_destinations(&compressed, filename)
+                    .into_iter()
+                    .flatten()
+                    .find(|path| path.exists())
+                {
                     return Some(path);
                 }
                 continue;
@@ -486,11 +490,17 @@ pub fn add_template_root(dir: PathBuf) {
 /// immutable store. The result is reused on later runs: the plain-file lookup
 /// above finds it first, so expansion happens once per install.
 fn template_destinations(compressed: &Path, filename: &str) -> [Option<PathBuf>; 2] {
-    [compressed.parent().map(|d| d.join(filename)), dirs::cache_dir().map(|c| c.join("smolvm").join(filename))]
+    [
+        compressed.parent().map(|d| d.join(filename)),
+        dirs::cache_dir().map(|c| c.join("smolvm").join(filename)),
+    ]
 }
 fn expand_template(compressed: &Path, filename: &str) -> std::io::Result<PathBuf> {
     let mut last_err = None;
-    for dest in template_destinations(compressed, filename).into_iter().flatten() {
+    for dest in template_destinations(compressed, filename)
+        .into_iter()
+        .flatten()
+    {
         if dest.exists() {
             return Ok(dest);
         }
@@ -1867,7 +1877,10 @@ mod tests {
     #[test]
     fn readonly_template_lookup_does_not_expand_compressed_input() {
         let dir = tempfile::tempdir().unwrap();
-        let name = format!("readonly-{}.ext4", dir.path().file_name().unwrap().to_string_lossy());
+        let name = format!(
+            "readonly-{}.ext4",
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
         let compressed = dir.path().join(format!("{name}.zst"));
         std::fs::write(&compressed, b"not even valid compressed input").unwrap();
         add_template_root(dir.path().to_path_buf());

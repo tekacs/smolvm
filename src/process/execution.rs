@@ -27,7 +27,9 @@ struct Containment {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum ExitProof { Absent }
+enum ExitProof {
+    Absent,
+}
 
 /// Exact boot/process/cgroup identity retained in the existing agent.pid record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,7 +159,9 @@ impl Execution {
     /// Caller holds this record's serialization lock. Never infer absence from
     /// arbitrary IO errors or from a reused numeric PID or cgroup pathname.
     fn observe_exit(&self) -> io::Result<bool> {
-        if self.containment.exited || self.boot != boot_id()? { return Ok(true); }
+        if self.containment.exited || self.boot != boot_id()? {
+            return Ok(true);
+        }
         match self.pin_current() {
             Ok(mut guard) => guard.exited(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -167,7 +171,13 @@ impl Execution {
                 let mut finished = self.containment.clone();
                 finished.exited = true;
                 finished.proof = Some(ExitProof::Absent);
-                publish(&self.path, self.pid, self.start, &self.boot, Some(&finished))?;
+                publish(
+                    &self.path,
+                    self.pid,
+                    self.start,
+                    &self.boot,
+                    Some(&finished),
+                )?;
                 Ok(true)
             }
             Err(error) => Err(error),

@@ -105,7 +105,11 @@ impl Group {
             return Ok(true);
         }
         let mut value = String::new();
-        match self.events.seek(SeekFrom::Start(0)).and_then(|_| (&mut self.events).take(4096).read_to_string(&mut value)) {
+        match self
+            .events
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| (&mut self.events).take(4096).read_to_string(&mut value))
+        {
             Ok(_) => populated(&value),
             // kernfs may retain nlink=2 after removal; the held event descriptor
             // reports ENODEV from seek or read for that removed original group.
