@@ -62,6 +62,14 @@ impl Cgroup {
         Ok(())
     }
 
+    pub(crate) fn absent(&self) -> io::Result<bool> {
+        match std::fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error),
+            Ok(_) => Ok(false), // Includes replacement paths: never act on a new inode.
+        }
+    }
+
     pub(crate) fn open(&self) -> io::Result<Group> {
         let directory = directory(&self.path)?;
         let metadata = directory.metadata()?;
@@ -96,10 +104,14 @@ impl Group {
         if self.directory.metadata()?.nlink() == 0 {
             return Ok(true);
         }
-        self.events.seek(SeekFrom::Start(0))?;
         let mut value = String::new();
-        (&mut self.events).take(4096).read_to_string(&mut value)?;
-        populated(&value)
+        match self.events.seek(SeekFrom::Start(0)).and_then(|_| (&mut self.events).take(4096).read_to_string(&mut value)) {
+            Ok(_) => populated(&value),
+            // kernfs may retain nlink=2 after removal; the held event descriptor
+            // reports ENODEV from seek or read for that removed original group.
+            Err(error) if error.raw_os_error() == Some(libc::ENODEV) => Ok(true),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn wait(&mut self, deadline: Instant) -> io::Result<bool> {

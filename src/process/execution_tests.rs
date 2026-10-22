@@ -12,6 +12,7 @@ fn fixture(root: &Path, boot: String) -> Execution {
         containment: Containment {
             group: Cgroup::capture(&group).unwrap(),
             exited: false,
+            proof: None,
             endpoints: None,
         },
     }
@@ -80,6 +81,65 @@ fn stale_completion_cannot_replace_a_newer_incarnation() {
     let before = std::fs::read(&old.path).unwrap();
     assert!(old.complete().is_err());
     assert_eq!(std::fs::read(&old.path).unwrap(), before);
+}
+
+#[test]
+fn removed_group_and_dead_process_persist_current_absence_without_deleting_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let mut record = fixture(root.path(), boot_id().unwrap());
+    let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    record.pid = child.id() as i32;
+    record.start = super::super::process_start_time(child.id() as i32).unwrap();
+    save(&record);
+    child.kill().unwrap(); child.wait().unwrap();
+    std::fs::remove_dir(root.path().join("group")).unwrap();
+    assert!(record.exited().unwrap());
+    let reopened = Execution::load(&record.path).unwrap().unwrap();
+    assert!(reopened.containment.exited);
+    assert_eq!(reopened.containment.proof, Some(ExitProof::Absent));
+    assert_eq!(reopened.pid, record.pid);
+    assert_eq!(reopened.start, record.start);
+    assert!(record.exited().unwrap(), "old handle accepts its durable completion");
+    record.reclaim().unwrap();
+    assert!(record.path.exists(), "reconciliation retains the original record");
+}
+
+#[test]
+fn missing_group_with_live_process_or_replacement_never_becomes_absence_proof() {
+    let root = tempfile::tempdir().unwrap();
+    let record = fixture(root.path(), boot_id().unwrap()); save(&record);
+    let before = std::fs::read(&record.path).unwrap();
+    std::fs::remove_dir(root.path().join("group")).unwrap();
+    assert!(record.exited().is_err());
+    std::fs::create_dir(root.path().join("group")).unwrap();
+    assert!(record.exited().is_err());
+    assert_eq!(std::fs::read(&record.path).unwrap(), before);
+}
+
+#[test]
+#[ignore = "requires an explicit disposable delegated SMOLVM_TEST_CGROUP root"]
+fn removed_kernel_group_reconciles_exit_before_new_incarnation() {
+    let base = PathBuf::from(std::env::var_os("SMOLVM_TEST_CGROUP").expect("explicit delegated root"));
+    let leaf = base.join(format!("removed-proof-{}", std::process::id()));
+    std::fs::create_dir(&leaf).unwrap();
+    let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    if let Err(error) = std::fs::write(leaf.join("cgroup.procs"), child.id().to_string()) {
+        let _ = child.kill(); let _ = child.wait(); let _ = std::fs::remove_dir(&leaf);
+        panic!("cannot place synthetic child: {error}");
+    }
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("agent.pid");
+    let identity = Cgroup::capture(&leaf).unwrap();
+    let mut pinned = identity.open().unwrap();
+    super::record(&path, child.id() as i32, Some(identity), None).unwrap();
+    child.kill().unwrap(); child.wait().unwrap();
+    std::fs::remove_dir(&leaf).unwrap();
+    assert!(pinned.empty().unwrap(), "removed held group is empty on the real kernel");
+    let prior = Execution::load(&path).unwrap().unwrap();
+    assert!(prior.exited().unwrap());
+    assert_eq!(Execution::load(&path).unwrap().unwrap().containment.proof, Some(ExitProof::Absent));
+    prior.reclaim().unwrap();
+    assert!(path.exists());
 }
 
 /// Explicit native test: no VM or helper image; only this test's two processes.

@@ -135,3 +135,16 @@ A later controller can inspect the retained evidence without an agent connection
 A different Linux boot ID proves that the recorded execution cannot remain alive.
 Legacy or uncapped launches do not provide a whole-instance exit guarantee.
 Neither a missing registry row nor a failed agent probe proves exit.
+
+For a retained contained execution whose process and original cgroup have both
+been removed, `Execution::exited` reconciles current absence under that record's
+serialization lock. It rechecks the unchanged execution identity, refuses a
+present/reused numeric PID or any replacement cgroup path, and durably records
+`exited=true` with proof `absent` before returning success. Unexpected IO errors
+remain errors. This records current containment absence, not a historical claim
+that a particular stop command succeeded. The execution record is not unlinked;
+owned socket cleanup and a successor start follow the ordinary exited path.
+A held cgroup event descriptor reporting ENODEV from either seek or read also
+proves removal of that original group, even when kernfs retains nlink=2.
+The optional proof field accepts earlier records; readers that reject unknown
+fields must be upgraded before reading newly reconciled records.

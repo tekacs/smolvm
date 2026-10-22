@@ -1865,6 +1865,19 @@ mod tests {
     }
 
     #[test]
+    fn readonly_template_lookup_does_not_expand_compressed_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!("readonly-{}.ext4", dir.path().file_name().unwrap().to_string_lossy());
+        let compressed = dir.path().join(format!("{name}.zst"));
+        std::fs::write(&compressed, b"not even valid compressed input").unwrap();
+        add_template_root(dir.path().to_path_buf());
+        assert!(existing_template(&name).is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        std::fs::write(dir.path().join(&name), b"already materialized").unwrap();
+        assert_eq!(existing_template(&name), Some(dir.path().join(&name)));
+    }
+
+    #[test]
     fn digest_to_filename_rejects_path_traversal() {
         // A valid hex digest is accepted.
         assert_eq!(

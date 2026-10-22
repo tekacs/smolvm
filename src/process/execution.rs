@@ -19,9 +19,15 @@ const PREFIX: &str = "containment-v1:";
 struct Containment {
     group: Cgroup,
     exited: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proof: Option<ExitProof>,
     #[serde(default)]
     endpoints: Option<super::sockets::Allocation>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExitProof { Absent }
 
 /// Exact boot/process/cgroup identity retained in the existing agent.pid record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +86,9 @@ impl Execution {
             .to_owned();
         let containment: Containment =
             serde_json::from_str(tail.strip_prefix(PREFIX).ok_or_else(invalid)?)?;
+        if containment.proof.is_some() && !containment.exited {
+            return Err(invalid());
+        }
         if let Some(endpoints) = &containment.endpoints {
             endpoints.validate(path.parent().ok_or_else(invalid)?)?;
         }
@@ -118,7 +127,7 @@ impl Execution {
     pub fn reclaim(&self) -> io::Result<()> {
         let _lock = lock(&self.path)?;
         let current = self.current()?;
-        if !current.exited()? {
+        if !current.observe_exit()? {
             return Err(io::Error::other("execution has not fully exited"));
         }
         if let Some(endpoints) = &current.containment.endpoints {
@@ -132,6 +141,7 @@ impl Execution {
             .ok_or_else(|| io::Error::other("execution record disappeared"))?;
         let mut expected = self.clone();
         expected.containment.exited = current.containment.exited;
+        expected.containment.proof = current.containment.proof;
         if current != expected {
             return Err(io::Error::other("execution record changed"));
         }
@@ -140,7 +150,28 @@ impl Execution {
 
     /// Observe exact kernel identities, or the durable completion of those identities.
     pub fn exited(&self) -> io::Result<bool> {
-        self.pin()?.exited()
+        let _lock = lock(&self.path)?;
+        self.current()?.observe_exit()
+    }
+
+    /// Caller holds this record's serialization lock. Never infer absence from
+    /// arbitrary IO errors or from a reused numeric PID or cgroup pathname.
+    fn observe_exit(&self) -> io::Result<bool> {
+        if self.containment.exited || self.boot != boot_id()? { return Ok(true); }
+        match self.pin_current() {
+            Ok(mut guard) => guard.exited(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !self.containment.group.absent()? || pidfd(self.pid)?.is_some() {
+                    return Err(error);
+                }
+                let mut finished = self.containment.clone();
+                finished.exited = true;
+                finished.proof = Some(ExitProof::Absent);
+                publish(&self.path, self.pid, self.start, &self.boot, Some(&finished))?;
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn pin(&self) -> io::Result<Guard> {
@@ -151,6 +182,10 @@ impl Execution {
                 group: None,
             });
         }
+        self.pin_current()
+    }
+
+    fn pin_current(&self) -> io::Result<Guard> {
         let group = self.containment.group.open()?;
         let process = process(self.pid, self.start)?;
         if process.is_some() {
@@ -201,7 +236,7 @@ pub(crate) fn record(
     }
     let _lock = lock(path)?;
     if let Some(prior) = Execution::load(path)? {
-        if !prior.exited()? {
+        if !prior.observe_exit()? {
             return Err(io::Error::other("previous execution has not exited"));
         }
         if let Some(endpoints) = &prior.containment.endpoints {
@@ -217,6 +252,7 @@ pub(crate) fn record(
     let containment = group.map(|group| Containment {
         group,
         exited: false,
+        proof: None,
         endpoints,
     });
     publish(path, pid, start, &boot, containment.as_ref())
