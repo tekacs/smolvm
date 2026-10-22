@@ -10,7 +10,10 @@ use std::{
 const GATE: &str = "SMOLVM_BOOT_ADMISSION";
 
 pub(super) fn configure(command: &mut Command) {
-    command.env(GATE, "1").stdin(Stdio::piped());
+    command
+        .env(GATE, "1")
+        .env("SMOLVM_BOOT_PARENT_ID", std::process::id().to_string())
+        .stdin(Stdio::piped());
 }
 
 /// Called by the matched helper before reading boot configuration or opening disks.
@@ -25,6 +28,16 @@ pub(crate) fn wait() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The launcher identity is captured before spawn, not after possible reparenting.
+#[cfg(unix)]
+pub(crate) fn parent() -> Result<i32> {
+    std::env::var("SMOLVM_BOOT_PARENT_ID")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| Error::agent("watch boot parent", "missing launcher identity"))
 }
 
 /// A lost controller before this write leaves the helper blocked; EOF refuses boot.
@@ -91,6 +104,7 @@ mod tests {
     fn child_entry() {
         let root = std::env::var_os("BOOT_TEST_ROOT").unwrap();
         if wait().is_ok() {
+            assert_eq!(parent().unwrap(), unsafe { libc::getppid() });
             std::fs::write(Path::new(&root).join("admitted"), b"yes").unwrap();
         }
     }

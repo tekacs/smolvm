@@ -91,7 +91,9 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     //
     // Detection is by reparenting: when the real parent dies the kernel reparents
     // this process (to init/launchd, or a subreaper), so `getppid()` changes from
-    // the value captured here at startup. The watcher polls for that change and
+    // the launcher identity passed before spawn. Capturing it here would adopt a
+    // replacement parent if the launcher died before helper initialization.
+    // The watcher polls for that change and
     // exits; the OS then tears the VM down with us. Polling (rather than an
     // inherited-pipe EOF) needs no fd plumbing, survives the
     // `close_inherited_fds_from(3)` call below, and uses only syscalls already in
@@ -113,7 +115,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     // as files that are simply gone.
     #[cfg(unix)]
     if std::env::var_os("SMOLVM_BOOT_WATCH_PARENT").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        crate::process::exit_when_parent_is_not_with(unsafe { libc::getppid() }, || {
+        crate::process::exit_when_parent_is_not_with(crate::agent::admission::parent()?, || {
             if let Some(socket) = AGENT_SOCKET.get() {
                 flush_guest_before_exit(socket);
             }

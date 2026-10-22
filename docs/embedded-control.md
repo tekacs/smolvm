@@ -44,7 +44,10 @@ or guest disks. The parent writes the child's PID, start time and Linux boot ID
 through an fsynced atomic identity file, then releases that pipe. Controller death
 before release closes the pipe and the helper refuses boot. Controller death after
 release leaves an inspectable incarnation even if guest readiness never completed.
-The early identity record is not rewritten during readiness bookkeeping.
+The early identity record is not rewritten during readiness bookkeeping. For
+parent-owned machines, the watchdog uses the launcher PID passed before spawn,
+not a replacement parent observed after admission. Watchdog thread creation
+failure terminates the helper rather than silently disabling the lifetime rule.
 
 ## Resource and exit evidence
 

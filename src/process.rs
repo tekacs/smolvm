@@ -3864,7 +3864,8 @@ pub fn exit_when_parent_is_not_with(parent: Pid, before_exit: impl FnOnce() + Se
             }
             before_exit();
             exit_child(0);
-        });
+        })
+        .unwrap_or_else(|_| exit_child(1));
 }
 
 /// Exit the current process immediately without cleanup.
@@ -4145,25 +4146,24 @@ mod tests {
         ));
     }
 
-    /// A forked child that watches for a parent it doesn't have exits at once
-    /// (its parent is gone, as far as it can tell); one watching its real
-    /// parent keeps running (#1193).
+    /// Use a new process: spawning Rust threads after fork from the multithreaded
+    /// test runner is not a valid test of the boot helper's fresh-process watchdog.
     #[cfg(unix)]
     #[test]
     fn a_child_exits_when_its_parent_is_gone() {
         let run_child = |watched: Pid| -> (i32, std::time::Duration) {
             let started = std::time::Instant::now();
-            let pid = unsafe { libc::fork() };
-            assert!(pid >= 0);
-            if pid == 0 {
-                exit_when_parent_is_not(watched);
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-                exit_child(3);
-            }
-            let mut status = 0;
-            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-            assert!(libc::WIFEXITED(status));
-            (libc::WEXITSTATUS(status), started.elapsed())
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "process::tests::watchdog_child", "--ignored"])
+                .env("WATCHDOG_TEST_PARENT", watched.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            (
+                status.code().expect("watchdog child terminated by signal"),
+                started.elapsed(),
+            )
         };
         let me = std::process::id() as Pid;
         let (code, elapsed) = run_child(me.wrapping_add(1_000_000));
@@ -4174,6 +4174,19 @@ mod tests {
         );
         let (code, _) = run_child(me);
         assert_eq!(code, 3, "a child whose parent lives runs to its own end");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "entrypoint explicitly spawned by watchdog test"]
+    fn watchdog_child() {
+        let watched = std::env::var("WATCHDOG_TEST_PARENT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        exit_when_parent_is_not(watched);
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        exit_child(3);
     }
 
     use super::*;
