@@ -353,6 +353,14 @@ fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
 
 /// Reference prefixes produced by [`resolve`] for the two local-source kinds.
 const LOCAL_ARCHIVE_PREFIX: &str = "local:";
+
+/// Address a pinned archive without staging it or reading its bytes.
+pub fn archive_reference(sha256: &str) -> Result<String> {
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return Err(Error::config("image archive", "invalid SHA256"));
+    }
+    Ok(format!("{LOCAL_ARCHIVE_PREFIX}{sha256}"))
+}
 const LOCAL_DIR_PREFIX: &str = "local-dir:";
 
 /// Whether a persisted image reference points at a local source (produced by

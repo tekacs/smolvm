@@ -39,6 +39,7 @@
 pub use imp::{
     discard_unbooted_archive_storage, prewarm_recent_seeds, revalidate_seed, seed_root,
     seed_storage, seed_storage_with_trust, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
+    prepare_image, prepared, SeedId, SeedSpec,
 };
 
 /// The smolvm binary that builds seeds. The SDKs run inside `node` or `python`,
@@ -200,6 +201,8 @@ pub fn revalidate_seed(_: &str, _: &str, _: &crate::registry::PullAuth) -> crate
 
 #[cfg(unix)]
 mod imp {
+    mod preparation;
+    pub use preparation::{prepare_image, prepared, SeedId, SeedSpec};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
@@ -461,16 +464,9 @@ mod imp {
             key_dir,
             cache,
             built,
-        } = ensure_seed(
-            exe,
-            image,
-            auth,
-            digest_ttl,
-            proxy,
-            no_proxy,
-            trust_host_certs,
-            small_seed_gb(storage_gb),
-        )?;
+        } = prepare_image(SeedSpec {
+            exe, image, auth, storage_gb, digest_ttl, proxy, no_proxy, trust_host_certs,
+        })?.seed;
         let Some((seed, format)) = seed_disk(&key_dir) else {
             return Err(Error::config(
                 "image seed",
@@ -533,57 +529,15 @@ mod imp {
             None => resolved_digest(image, auth, digest_ttl, resolve)?,
         };
         let key = seed_key(image, &digest, template.as_deref(), small_gb)?;
-        let root = seed_root();
-        std::fs::create_dir_all(&root).map_err(|e| Error::config("image seed", e.to_string()))?;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o711))
-            .map_err(|e| Error::config("image seed", e.to_string()))?;
-        let key_dir = root.join(&key);
-        let mut built = false;
-        // A cache hit holds the shared lock through overlay publication. Prune
-        // takes the exclusive lock before scanning backing references, so it
-        // cannot miss an overlay being created and then delete its base.
-        let mut cache = CacheLock::shared(&root)?;
-        if seed_disk(&key_dir).is_none() {
-            drop(cache);
-            // One builder per image; concurrent first starts wait for it and
-            // then share it. This lock file is permanent: unlinking a locked
-            // file would let new callers lock a different inode for this key.
-            let _build = Lock::exclusive(&root.join(format!("{key}.lock")))?;
-            if seed_disk(&key_dir).is_none() {
-                build_seed(
-                    exe,
-                    image,
-                    auth,
-                    &key,
-                    &key_dir,
-                    proxy,
-                    no_proxy,
-                    trust_host_certs,
-                    small_gb,
-                )?;
-                // The builder pulled the tag, not the digest. If the tag moved
-                // in the meantime, discard the seed rather than miskey it. An
-                // archive is its content, so it cannot have moved.
-                if archive_hash.is_none() && resolve()? != digest {
-                    let _ = std::fs::remove_dir_all(&key_dir);
-                    // The cached digest is what moved. Drop it, or every
-                    // retry inside the TTL window repeats this build and
-                    // fails the same way.
-                    let _ = std::fs::remove_file(digest_cache_path(image, auth));
-                    return Err(Error::config(
-                        "image seed",
-                        format!("{image} moved during the seed build"),
-                    ));
-                }
-                built = true;
+        preparation::ensure(seed_root(), &key, |key_dir| {
+            build_seed(exe, image, auth, &key, key_dir, proxy, no_proxy, trust_host_certs, small_gb)?;
+            // Preserve authorization/digest revalidation for mutable registry tags.
+            if archive_hash.is_none() && resolve()? != digest {
+                let _ = std::fs::remove_dir_all(key_dir);
+                let _ = std::fs::remove_file(digest_cache_path(image, auth));
+                return Err(Error::config("image seed", format!("{image} moved during the seed build")));
             }
-            cache = CacheLock::shared(&root)?;
-        }
-        Ok(EnsuredSeed {
-            root,
-            key_dir,
-            cache,
-            built,
+            Ok(())
         })
     }
 
@@ -1251,7 +1205,9 @@ mod imp {
     /// Run one step of a seed build with this smolvm binary, capturing its output so
     /// the builder's chatter stays off the caller's terminal.
     fn run(exe: &Path, args: &[&str]) -> Result<()> {
-        let out = std::process::Command::new(exe)
+        let mut command = std::process::Command::new(exe);
+        crate::embedded::bundle::configure(&mut command);
+        let out = command
             .args(args)
             .env("SMOLVM_IMAGE_SEEDS", "0")
             // An embedder's helper variable would tie the builder VM's life to

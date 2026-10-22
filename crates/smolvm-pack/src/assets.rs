@@ -413,6 +413,15 @@ fn publish_agent_rootfs_tar(built: &Path, cached: &Path) {
 /// ship only the compressed form; the plain file is still honored so existing
 /// installs and development trees keep working untouched.
 pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
+    find_template(filename, true)
+}
+
+/// Read-only lookup: never materializes compressed templates or creates cache paths.
+pub fn existing_template(filename: &str) -> Option<PathBuf> {
+    find_template(filename, false)
+}
+
+fn find_template(filename: &str, materialize: bool) -> Option<PathBuf> {
     let mut roots: Vec<PathBuf> = TEMPLATE_ROOTS
         .lock()
         .map(|roots| roots.clone())
@@ -435,6 +444,12 @@ pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
     for root in &roots {
         let compressed = root.join(format!("{filename}.zst"));
         if compressed.exists() {
+            if !materialize {
+                if let Some(path) = template_destinations(&compressed, filename).into_iter().flatten().find(|path| path.exists()) {
+                    return Some(path);
+                }
+                continue;
+            }
             match expand_template(&compressed, filename) {
                 Ok(path) => return Some(path),
                 Err(e) => {
@@ -470,12 +485,12 @@ pub fn add_template_root(dir: PathBuf) {
 /// the user cache — the read-only case is the normal one for Nix and any other
 /// immutable store. The result is reused on later runs: the plain-file lookup
 /// above finds it first, so expansion happens once per install.
+fn template_destinations(compressed: &Path, filename: &str) -> [Option<PathBuf>; 2] {
+    [compressed.parent().map(|d| d.join(filename)), dirs::cache_dir().map(|c| c.join("smolvm").join(filename))]
+}
 fn expand_template(compressed: &Path, filename: &str) -> std::io::Result<PathBuf> {
-    let beside = compressed.parent().map(|d| d.join(filename));
-    let cached = dirs::cache_dir().map(|c| c.join("smolvm").join(filename));
-
     let mut last_err = None;
-    for dest in [beside, cached].into_iter().flatten() {
+    for dest in template_destinations(compressed, filename).into_iter().flatten() {
         if dest.exists() {
             return Ok(dest);
         }
