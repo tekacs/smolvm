@@ -9505,10 +9505,25 @@ mod sparse_copy_differential_tests {
                 "case {case}: fast path diverged from old algorithm"
             );
             #[cfg(unix)]
-            assert!(
-                blocks(&fast) <= blocks(&slow),
-                "case {case}: fast path is less sparse than the old one"
-            );
+            {
+                // Allocated-block counts can lag buffered writes, especially on
+                // compressed filesystems. Compare both copies after writeback,
+                // not whichever allocation state each happens to report first.
+                File::open(&fast)
+                    .expect("open fast")
+                    .sync_all()
+                    .expect("sync fast");
+                File::open(&slow)
+                    .expect("open reference")
+                    .sync_all()
+                    .expect("sync reference");
+                let fast_blocks = blocks(&fast);
+                let reference_blocks = blocks(&slow);
+                assert!(
+                    fast_blocks <= reference_blocks,
+                    "seed 0x5EED case {case} size {size}: fast {fast_blocks} blocks > reference {reference_blocks} blocks"
+                );
+            }
         }
     }
 
