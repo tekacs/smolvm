@@ -14,10 +14,33 @@ persisting them. Validation rejects excess mappings, malformed or nonabsolute
 paths, oversized socket addresses, missing mount sources and duplicate guest
 mount destinations. Launch reconstructs the mappings from the persisted record;
 a stopped restart does not discard them. The boot helper refuses missing mount
-sockets, existing expose destinations and failed bridge registration. It never
-blindly unlinks a destination; a controller must prove exit and ownership before
-removing a stale listener. Machine specifications are immutable
-for a caller that requires generation-fenced execution.
+sockets, existing expose destinations and failed bridge registration. Explicit host
+paths remain caller-owned; contained execution cleanup never removes them, including
+borrowed mount listeners. Machine specifications are immutable for a caller that requires
+generation-fenced execution.
+
+In the Linux subprocess launcher, an expose mapping without a host path requests
+an engine-owned endpoint.
+The launcher allocates one private directory per execution and persists its device,
+inode and guest-to-host mappings in the execution record before admitting the helper.
+This requires contained execution. `Execution::sockets` returns those same mappings
+after controller replacement; it does not allocate new endpoints or prove readiness.
+Applications keep the returned paths bound to that execution, not a movable alias.
+
+Cleanup requires whole-execution exit, the unchanged execution record and the same
+directory inode. It removes only the recorded socket names, refuses unexpected file
+types or directory contents, and never follows a replaced directory. Thus an admitted
+helper that dies before binding needs no invented bind receipt for cleanup. A caller
+endpoint inside the machine's data directory blocks directory deletion until its
+owner removes it. Allocation interrupted before execution-record publication can
+leave an unrecorded directory; automatic collection of those directories is not
+implemented.
+
+The owned directory is reserved for serialized trusted engine writers. Mode 0700
+excludes other UIDs, not hostile host processes with the same UID. Arbitrary same-UID
+host mutation is outside this guest-isolation contract; this does not weaken guest
+filesystem confinement or permit removing a replaced directory. Caller-specified
+paths retain their separate collision/refusal contract.
 
 ## Helper environment
 
@@ -40,8 +63,11 @@ service configured to kill its entire cgroup can kill detached VMs too.
 ## Launch admission
 
 The matched helper waits on a private stdin pipe before opening boot configuration
-or guest disks. The parent writes the child's PID, start time and Linux boot ID
-through an fsynced atomic identity file, then releases that pipe. Controller death
+or guest disks. On Linux the parent first places the blocked child in its requested
+delegated cgroup or systemd scope. It then writes the child's PID, start time, Linux
+boot ID and exact cgroup device/inode through one fsynced atomic identity file,
+then releases that pipe. Placement or publication failure kills and reaps only
+that unreaped child without admitting it. Controller death
 before release closes the pipe and the helper refuses boot. Controller death after
 release leaves an inspectable incarnation even if guest readiness never completed.
 The early identity record is not rewritten during readiness bookkeeping. For
@@ -49,11 +75,36 @@ parent-owned machines, the watchdog uses the launcher PID passed before spawn,
 not a replacement parent observed after admission. Watchdog thread creation
 failure terminates the helper rather than silently disabling the lifetime rule.
 
+## Trusted initialization
+
+`MachineSpec::init` stores trusted provisioning commands in the existing machine
+record. The embedded launcher runs them as guest root on the image's persistent
+overlay and configured mounts before starting its workload user. CLI and embedded
+launch use the same command construction and failure handling; their output policy
+differs (interactive CLI output versus captured embedded output).
+
+A nonzero command exit refuses workload launch. The runtime durably records
+`init_completed` only after all commands succeed. Commands must tolerate replay:
+a controller can lose the success reply before recording it. Image environment and
+working directory apply, but image `USER` never changes provisioning away from
+root. Neither initialization nor VM boot proves an application is ready; callers
+must probe the application identity. A live VM left before workload startup is not
+a ready resource and is not silently admitted as one.
+
 ## Resource and exit evidence
 
 Linux delegated-cgroup placement establishes limits before joining the VM leaf.
 An error writing required limits or membership refuses launch, rather than
-continuing uncapped. A successful stop request alone does not establish whole-tree
-exit; controllers must retain exact process incarnation and cgroup identity until
-physical exit is established. Neither a missing registry row nor a failed agent
-probe proves that an earlier launch cannot still run.
+continuing uncapped. The launcher records containment before boot admission; the
+helper does not repeat placement after entering the populated leaf.
+
+For a recorded contained execution, stop pins the exact cgroup directory and the
+process incarnation before shutdown. Signals use a pidfd, not a re-read numeric
+PID. Stop waits for process exit and `cgroup.events` reporting `populated 0`;
+remaining descendants receive `cgroup.kill` after the graceful deadline. Timeout,
+missing evidence or changed cgroup identity refuses completion and retains the
+record. Completed exit is fsynced into that same record before runtime cleanup.
+A later controller can inspect the retained evidence without an agent connection.
+A different Linux boot ID proves that the recorded execution cannot remain alive.
+Legacy or uncapped launches do not provide a whole-instance exit guarantee.
+Neither a missing registry row nor a failed agent probe proves exit.

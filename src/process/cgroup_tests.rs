@@ -1,4 +1,4 @@
-use super::place_in_cgroup;
+use super::cgroup::place;
 use std::fs;
 
 const CONTROLS: &[&str] = &[
@@ -26,7 +26,7 @@ fn missing_required_control_refuses_membership() {
         let vm = leaf(root.path());
         fs::remove_file(vm.join(missing)).unwrap();
         assert!(
-            place_in_cgroup(root.path(), 1, 512, false, false).is_err(),
+            place(root.path(), std::process::id() as i32, 1, 512, false, false).is_err(),
             "{missing}"
         );
         if *missing != "cgroup.procs" {
@@ -45,7 +45,7 @@ fn a_populated_descendant_or_missing_evidence_refuses_reuse() {
         let vm = leaf(root.path());
         fs::write(vm.join("cgroup.events"), events).unwrap();
         // The direct procs file is empty; that alone must not authorize reuse.
-        assert!(place_in_cgroup(root.path(), 1, 512, false, false).is_err());
+        assert!(place(root.path(), std::process::id() as i32, 1, 512, false, false).is_err());
         assert!(fs::read(vm.join("cpu.max")).unwrap().is_empty());
         assert!(fs::read(vm.join("cgroup.procs")).unwrap().is_empty());
     }
@@ -54,7 +54,7 @@ fn a_populated_descendant_or_missing_evidence_refuses_reuse() {
 #[test]
 fn absent_delegation_never_creates_fake_control_files() {
     let root = tempfile::tempdir().unwrap();
-    assert!(place_in_cgroup(root.path(), 1, 512, false, false).is_err());
+    assert!(place(root.path(), std::process::id() as i32, 1, 512, false, false).is_err());
     let vm = root.path().join(format!("vm-{}", std::process::id()));
     assert!(!vm.join("cpu.max").exists());
     assert!(!vm.join("cgroup.procs").exists());

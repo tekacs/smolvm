@@ -828,6 +828,8 @@ impl PackRunCmd {
                 cuda: false,
                 expose_docker: false,
                 published_sockets: Vec::new(),
+                #[cfg(target_os = "linux")]
+                endpoints: None,
                 dns_filter_hosts: self
                     .egress
                     .as_ref()
@@ -2023,6 +2025,8 @@ fn run_from_cache(
             cuda: false,
             expose_docker: false,
             published_sockets: Vec::new(),
+            #[cfg(target_os = "linux")]
+            endpoints: None,
             dns_filter_hosts: None,
             packed_layers_dir: Some(layers_dir.to_path_buf()),
             packed_layers_dax_window: smolvm::agent::legacy_packed_layers_dax_window(),
@@ -2421,6 +2425,8 @@ fn daemon_start(
             cuda: false,
             expose_docker: false,
             published_sockets: Vec::new(),
+            #[cfg(target_os = "linux")]
+            endpoints: None,
             dns_filter_hosts: None,
             packed_layers_dir: Some(layers_dir.to_path_buf()),
             packed_layers_dax_window: smolvm::agent::legacy_packed_layers_dax_window(),

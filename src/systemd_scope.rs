@@ -81,7 +81,7 @@ fn busctl_bounded(mut cmd: Command, timeout: Duration) -> Result<Output> {
 
 /// Resource caps applied to the VM's scope (as systemd unit properties).
 ///
-/// Mirrors the per-VM cgroup limits set by [`crate::process::place_in_cgroup`]:
+/// Mirrors the per-VM cgroup limits set by [`crate::process::cgroup`]:
 /// `MemoryMax` ↔ `memory.max`, `CPUQuotaPerSecUSec` ↔ `cpu.max`, `TasksMax` ↔
 /// `pids.max`.
 #[derive(Debug, Default, Clone)]

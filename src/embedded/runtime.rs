@@ -104,6 +104,18 @@ impl EmbeddedRuntime {
         }
     }
 
+    /// Read retained Linux containment identity without contacting the guest.
+    /// `None` means no whole-instance evidence, not proof that the machine exited.
+    #[cfg(target_os = "linux")]
+    pub fn execution(&self, name: &str) -> Result<Option<crate::process::execution::Execution>> {
+        self.with_name_lock(name, || {
+            control::get_record(&self.db, name)?;
+            Ok(crate::process::execution::Execution::load(
+                &crate::agent::vm_data_dir(name).join("agent.pid"),
+            )?)
+        })
+    }
+
     /// Create a persisted machine record.
     pub fn create_machine(&self, spec: MachineSpec) -> Result<()> {
         self.with_name_lock(&spec.name, || control::create_vm(&self.db, &spec))
@@ -541,11 +553,7 @@ impl EmbeddedRuntime {
             let started = control::start_vm_with_interceptor(&self.db, name, interceptor)?;
             let mut handle = started.handle;
             if started.freshly_started {
-                if let Err(error) = self.launch_image_workload(name, &mut handle) {
-                    let _ = handle.stop();
-                    let _ = control::mark_stopped(&self.db, name);
-                    return Err(error);
-                }
+                self.launch_image_workload(name, &mut handle)?;
             }
             self.insert_handle(name, handle)?;
             Ok(())
@@ -603,11 +611,7 @@ impl EmbeddedRuntime {
             let started = control::start_vm_with_interceptor(&self.db, name, interceptor)?;
             let mut handle = started.handle;
             if started.freshly_started {
-                if let Err(error) = self.launch_image_workload(name, &mut handle) {
-                    let _ = handle.stop();
-                    let _ = control::mark_stopped(&self.db, name);
-                    return Err(error);
-                }
+                self.launch_image_workload(name, &mut handle)?;
             }
             self.insert_handle(name, handle)?;
             Ok(())
@@ -627,7 +631,13 @@ impl EmbeddedRuntime {
                 }
                 self.remove_cached_handle(name)?;
             }
-            let handle = control::start_vm_with_netns(&self.db, name, netns)?;
+            let mut handle = control::start_vm_with_netns(&self.db, name, netns)?;
+            if let Err(error) = self.initialize(name, &mut handle) {
+                if handle.stop().is_ok() {
+                    control::mark_stopped(&self.db, name)?;
+                }
+                return Err(error);
+            }
             self.insert_handle(name, handle)?;
             Ok(())
         })
@@ -650,11 +660,7 @@ impl EmbeddedRuntime {
             let started = control::start_forkable_vm(&self.db, name)?;
             let mut handle = started.handle;
             if started.freshly_started {
-                if let Err(error) = self.launch_image_workload(name, &mut handle) {
-                    let _ = handle.stop();
-                    let _ = control::mark_stopped(&self.db, name);
-                    return Err(error);
-                }
+                self.launch_image_workload(name, &mut handle)?;
             }
             self.insert_handle(name, handle)?;
             Ok(())
@@ -1268,9 +1274,27 @@ impl EmbeddedRuntime {
             .collect())
     }
 
-    fn launch_image_workload(&self, name: &str, handle: &mut VmHandle) -> Result<()> {
+    fn initialize(&self, name: &str, handle: &mut VmHandle) -> Result<()> {
         let record = control::get_record(&self.db, name)?;
-        handle.launch_image_workload(name, &record)
+        if !record.init_completed && (record.image.is_some() || !record.init.is_empty()) {
+            handle.initialize(&record)?;
+            self.db
+                .update_vm_durable(name, |record| record.init_completed = true)?
+                .ok_or_else(|| Error::vm_not_found(name))?;
+        }
+        Ok(())
+    }
+
+    fn launch_image_workload(&self, name: &str, handle: &mut VmHandle) -> Result<()> {
+        let launched = (|| {
+            self.initialize(name, handle)?;
+            let record = control::get_record(&self.db, name)?;
+            handle.launch_image_workload(name, &record)
+        })();
+        if launched.is_err() && handle.stop().is_ok() {
+            control::mark_stopped(&self.db, name)?;
+        }
+        launched
     }
 
     /// The machine's remote volumes, resolved against its own recorded env.

@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+mod execution;
+
 use super::launcher;
 use super::{HostMount, PortMapping, VmResources};
 
@@ -1735,6 +1738,12 @@ impl AgentManager {
         None
     }
 
+    /// Retained whole-instance identity; absence is not proof of exit.
+    #[cfg(target_os = "linux")]
+    pub fn execution(&self) -> Result<Option<process::execution::Execution>> {
+        Ok(process::execution::Execution::load(&self.pid_file)?)
+    }
+
     /// Read PID and start time from the PID file.
     fn read_pid_file_with_start_time(&self) -> Option<(i32, Option<u64>)> {
         let content = std::fs::read_to_string(&self.pid_file).ok()?;
@@ -2336,6 +2345,17 @@ impl AgentManager {
     }
 
     fn verify_no_persisted_process(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(execution) = self.execution()? {
+            if execution.exited()? {
+                execution.reclaim()?;
+                return Ok(());
+            }
+            return Err(Error::agent(
+                "start agent",
+                "recorded execution has not fully exited",
+            ));
+        }
         if let Some((pid, _)) = self.read_pid_file_with_start_time() {
             refuse_live_launch_pid(pid)?;
         }
@@ -2353,6 +2373,15 @@ impl AgentManager {
     /// Preserve process identity and the launch lock unless teardown succeeds.
     fn abort_failed_launch(&self, pid: i32) -> Result<()> {
         self.inner.lock().child = Some(ChildProcess::new(pid));
+        #[cfg(target_os = "linux")]
+        if let Some(execution) = self.execution()? {
+            if execution.pid() != pid {
+                return Err(Error::agent("abort launch", "execution record changed"));
+            }
+            execution.pin()?.kill(process::VM_SIGKILL_TIMEOUT)?;
+            self.mark_stopped();
+            return Ok(());
+        }
         if let Err(error) = super::admission::record(&self.pid_file, pid) {
             tracing::warn!(pid, %error, "could not persist failed launch identity; retaining child handle");
         }
@@ -2621,7 +2650,6 @@ impl AgentManager {
         // each other (and `set_var` is `unsafe` in edition 2024 for that reason).
         let fork_clone = features.snapshot_dir.is_some();
         // Account conservatively for shared backing plus private COW pages.
-        #[cfg(target_os = "linux")]
         let fork_memfd = features.forkable || fork_clone;
         let cuda_clone = fork_clone && (features.cuda || resources_for_config.cuda);
         let fork_env: Vec<(&str, String)> = {
@@ -2881,6 +2909,14 @@ impl AgentManager {
         let records_window = features.packed_layers_dir.is_some();
         let leased_layers = features.packed_layers_dir.clone();
 
+        #[cfg(target_os = "linux")]
+        let endpoints = process::sockets::Allocation::prepare(
+            self.pid_file
+                .parent()
+                .ok_or_else(|| Error::agent("allocate sockets", "missing VM directory"))?,
+            &mut features.published_sockets,
+        )?;
+
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
             rootfs_path: self.rootfs_path.clone(),
@@ -2900,6 +2936,8 @@ impl AgentManager {
             cuda: features.cuda || resources_for_config.cuda,
             expose_docker: features.expose_docker,
             published_sockets: features.published_sockets,
+            #[cfg(target_os = "linux")]
+            endpoints,
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,
             external_interceptor: features.external_interceptor,
@@ -3128,7 +3166,10 @@ impl AgentManager {
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
-        super::admission::release(&mut child, &self.pid_file)?;
+        let adopted_scope =
+            super::admission::admit(&mut child, &self.pid_file, &config, self.name(), fork_memfd)?;
+        #[cfg(not(target_os = "linux"))]
+        let _ = adopted_scope;
 
         let child_pid = child.id() as i32;
         // Register the detached VM PID for the serve supervisor's selective
@@ -3159,42 +3200,6 @@ impl AgentManager {
             spawn_ms = spawn_start.elapsed().as_millis(),
             "boot: subprocess spawned"
         );
-
-        // Lossless-restart placement: on a systemd host, adopt the just-forked VM
-        // into its own `smolvm-vm-<id>.scope` (sibling unit, owned by PID1) so a
-        // later `serve` restart can't kill or `219/CGROUP`-crash on it. Serve set
-        // SMOLVM_VM_USE_SCOPE at startup and did NOT set SMOLVM_CGROUP_ROOT, so the
-        // boot subprocess skipped self-placement and the VM is still in serve's
-        // cgroup for this microsecond window — the adopt moves it out. Caps mirror
-        // process::place_in_cgroup (VMM_MEM_OVERHEAD_MIB=768, CGROUP_PIDS_MAX
-        // =1024) as scope properties. Required placement fails closed.
-        #[cfg(target_os = "linux")]
-        let mut adopted_scope = None;
-        #[cfg(target_os = "linux")]
-        if crate::embedded::bundle::boot_var("SMOLVM_VM_USE_SCOPE").is_some() {
-            if let Some(name) = self.name() {
-                let budget = crate::process::vmm_memory_budget(
-                    resources_for_config.memory_mib,
-                    config.cuda,
-                    fork_memfd,
-                );
-                let caps = crate::systemd_scope::ScopeCaps {
-                    memory_max_bytes: Some(budget.max_bytes),
-                    memory_high_bytes: Some(budget.high_bytes),
-                    cpu_quota_usec_per_sec: Some(
-                        u64::from(resources_for_config.cpus.max(1)) * 1_000_000,
-                    ),
-                    tasks_max: Some(1024),
-                };
-                if let Err(e) = crate::systemd_scope::adopt_into_scope(name, child_pid, &caps) {
-                    // Terminate only this newly spawned child, never the existing
-                    // same-name scope: it may still own another live process.
-                    self.abort_failed_launch(child_pid)?;
-                    return Err(Error::agent("adopt VM scope", e.to_string()));
-                }
-                adopted_scope = Some(name);
-            }
-        }
 
         let launched = self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config);
         #[cfg(target_os = "linux")]
@@ -3319,6 +3324,16 @@ impl AgentManager {
         guest_is_paused: bool,
         stop_timeout: Option<Duration>,
     ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(execution) = self.execution()? {
+            if execution.pid() != pid || Some(execution.started()) != start_time {
+                return Err(Error::agent(
+                    "stop execution",
+                    "cached incarnation does not match its record",
+                ));
+            }
+            return self.stop_execution(execution, guest_is_paused, stop_timeout);
+        }
         // A paused guest has no vCPU to service the request and nothing left to
         // flush, so skip the handshake rather than wait out its deadline and
         // then refuse the stop. Identity is still verified below, from the PID
@@ -3445,6 +3460,11 @@ impl AgentManager {
             &ready_marker,
             &workload_log_socket,
         ] {
+            #[cfg(target_os = "linux")]
+            if path == &self.pid_file && !matches!(self.execution(), Ok(None)) {
+                // Retain exact whole-instance completion until replacement/remove.
+                continue;
+            }
             if let Err(e) = std::fs::remove_file(path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::debug!(error = %e, path = %path.display(), "failed to remove marker file");
@@ -3491,6 +3511,13 @@ impl AgentManager {
     /// Kill the VM and wait up to `timeout` before reclaiming its resources.
     /// Large disposable helpers can take longer to release their mappings.
     pub fn kill_and_wait(&self, timeout: std::time::Duration) {
+        #[cfg(target_os = "linux")]
+        if let Some(result) = self.kill_execution(timeout) {
+            if let Err(error) = result {
+                tracing::warn!(%error, "execution retained after failed kill");
+            }
+            return;
+        }
         // Two PID sources with very different PID-reuse risk:
         //   - the in-memory child: a direct child we still own, so the kernel
         //     cannot recycle its PID until we reap it → safe to SIGKILL by PID.
@@ -3569,6 +3596,11 @@ impl AgentManager {
     ///
     /// Only safe for ephemeral VMs after the process is confirmed dead.
     pub fn cleanup_data_dir(&self) {
+        #[cfg(target_os = "linux")]
+        if let Err(error) = self.reclaim_paths() {
+            tracing::warn!(%error, "retaining data without owned-path cleanup evidence");
+            return;
+        }
         self.cleanup_cuda_ring_dir();
         if let Some(ref name) = self.name {
             let dir = vm_data_dir(name);

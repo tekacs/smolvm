@@ -72,14 +72,39 @@ impl VmHandle {
         self.client_mut()?.list_images()
     }
 
+    /// Run trusted provisioning before starting an unprivileged workload.
+    /// The runtime records completion separately, only after this returns.
+    pub fn initialize(&mut self, record: &VmRecord) -> Result<()> {
+        let client = self.client_mut()?;
+        let info = record
+            .image
+            .as_deref()
+            .map(|image| client.pull_with_registry_config(image))
+            .transpose()?;
+        let mut env = record.env.clone();
+        env.extend(crate::embedded::control::credential_env(record));
+        crate::workload::init::run(
+            client,
+            &record.init,
+            crate::workload::init::Context {
+                image: record.image.as_deref(),
+                image_info: info.as_ref(),
+                env: &env,
+                workdir: record.workdir.as_deref(),
+                record_mounts: &record.mounts,
+                overlay_id: &crate::workload::record_overlay_owner(record),
+            },
+            false,
+        )
+    }
+
     /// Pull and launch an image machine's persistent workload before the SDK
     /// reports create/start complete.
     pub fn launch_image_workload(&mut self, name: &str, record: &VmRecord) -> Result<()> {
-        let Some(image) = record.image.as_deref() else {
+        if record.image.is_none() {
             return Ok(());
-        };
+        }
         let client = self.client_mut()?;
-        client.pull_with_registry_config(image)?;
         let mut env = record.env.clone();
         env.extend(crate::embedded::control::credential_env(record));
         crate::workload::launch_image_workload(client, name, record, env)?;

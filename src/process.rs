@@ -385,11 +385,10 @@ pub fn set_dumpable(_dumpable: bool) {}
 //   1. `setup_cgroup_delegation_root` (supervisor): vacate our own process into
 //      a leaf so the parent can become a delegated root that distributes
 //      cpu/memory/pids to per-VM children.
-//   2. `place_in_cgroup` (VMM subprocess): create a capped `vm-<pid>` leaf under
+//   2. `cgroup::place` (launcher): create a capped `vm-<pid>` leaf under
 //      that root and join it.
-// Both are best-effort and Linux-only — a near-no-op on macOS dev (single
-// tenant), and on Linux they degrade to "uncapped but still booting" whenever
-// cgroup v2 isn't delegated to us, since hardening must never block boot.
+// Linux-only. Delegation discovery is optional; once containment is requested,
+// placement and required limit failures refuse boot before disk access.
 // ============================================================================
 
 /// CPU accounting period for `cpu.max` (cgroup v2 default, 100 ms).
@@ -476,8 +475,8 @@ fn write_cgroup(dir: &std::path::Path, file: &str, val: &str) -> std::io::Result
 /// Because of the "no internal processes" rule, we first move *our own* process
 /// into a `supervisor` leaf, then enable `cpu`/`memory`/`pids` distribution on
 /// the now-empty parent. That parent is returned as the root to pass to
-/// [`place_in_cgroup`]. Pass the returned path to each VMM subprocess (e.g. via
-/// the `SMOLVM_CGROUP_ROOT` env var) so it can self-place.
+/// [`cgroup::place`]. The launcher reads `SMOLVM_CGROUP_ROOT` from its selected
+/// boot environment and places the blocked child before admitting it.
 ///
 /// Returns `None` (and changes nothing observable) when cgroup v2 isn't
 /// delegated to us — e.g. the process isn't under a systemd unit with
@@ -500,74 +499,12 @@ pub fn setup_cgroup_delegation_root() -> Option<std::path::PathBuf> {
     Some(root)
 }
 
-/// VMM-subprocess-side: place THIS process into a capped `vm-<pid>` leaf under
-/// `root`, deriving limits from the VM's resources.
-///
-/// Required caps applied before joining the leaf:
-/// - `cpu.max` = `vcpus * 100ms / 100ms` → bounds CPU to ~`vcpus` cores.
-/// - `pids.max` = [`CGROUP_PIDS_MAX`] → caps host tasks (fork-bomb containment).
-/// - `memory.high`/`memory.max` = guest RAM, unreclaimable-mapping allowance,
-///   and proportional overhead, with a reclaim stage below the ceiling.
-///
-/// `root` must be a delegated root with `cpu`/`memory`/`pids` enabled in its
-/// `subtree_control` (see [`setup_cgroup_delegation_root`]); otherwise the limit
-/// files won't exist and this operation fails. The boot caller must propagate
-/// failure rather than enter the hypervisor without the requested containment.
 #[cfg(target_os = "linux")]
-pub fn place_in_cgroup(
-    root: &std::path::Path,
-    vcpus: u8,
-    memory_mib: u32,
-    cuda: bool,
-    memfd_backed: bool,
-) -> std::io::Result<()> {
-    let pid = unsafe { libc::getpid() };
-    let vm = root.join(format!("vm-{pid}"));
-    match std::fs::create_dir(&vm) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = std::fs::symlink_metadata(&vm)?;
-            let empty = std::fs::read_to_string(vm.join("cgroup.events"))?
-                .lines()
-                .any(|line| line.trim() == "populated 0");
-            if metadata.file_type().is_symlink() || !metadata.is_dir() || !empty {
-                return Err(std::io::Error::other("VM cgroup is not an empty directory"));
-            }
-        }
-        Err(error) => return Err(error),
-    }
-
-    let quota_us = u64::from(vcpus.max(1)) * CGROUP_CPU_PERIOD_US;
-    let budget = vmm_memory_budget(memory_mib, cuda, memfd_backed);
-    let limits = [
-        ("cpu.max", format!("{quota_us} {CGROUP_CPU_PERIOD_US}")),
-        ("pids.max", CGROUP_PIDS_MAX.to_string()),
-        ("memory.high", budget.high_bytes.to_string()),
-        ("memory.max", budget.max_bytes.to_string()),
-    ];
-    for (name, value) in limits {
-        write_cgroup(&vm, name, &value)?;
-        if std::fs::read_to_string(vm.join(name))?.trim() != value {
-            return Err(std::io::Error::other("VM cgroup limit readback mismatch"));
-        }
-    }
-
-    // Join only after every required control exists and acknowledges its limit.
-    write_cgroup(&vm, "cgroup.procs", &pid.to_string())?;
-    if !std::fs::read_to_string(vm.join("cgroup.procs"))?
-        .split_whitespace()
-        .any(|value| value == pid.to_string())
-    {
-        return Err(std::io::Error::other(
-            "VM cgroup membership not established",
-        ));
-    }
-    tracing::info!(
-        vcpus, memory_mib, cuda, cgroup = %vm.display(),
-        "placed VMM subprocess in verified cpu/pids/memory cgroup"
-    );
-    Ok(())
-}
+pub mod cgroup;
+#[cfg(target_os = "linux")]
+pub mod execution;
+#[cfg(target_os = "linux")]
+pub mod sockets;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "process/cgroup_tests.rs"]
@@ -3474,45 +3411,7 @@ enum ExitEvent {
 /// not our children, which a VM started by an earlier CLI invocation is not.
 #[cfg(target_os = "linux")]
 fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
-    // SAFETY: pidfd_open takes a pid and a flags word and returns a new fd.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
-    if fd < 0 {
-        return match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => ExitEvent::Exited,
-            _ => ExitEvent::Unavailable,
-        };
-    }
-    // SAFETY: a non-negative return is a fresh fd this function owns.
-    let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd as i32) };
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let mut pollfd = libc::pollfd {
-            fd: std::os::fd::AsRawFd::as_raw_fd(&fd),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // Round up: poll counts whole milliseconds, and truncating would
-        // return before the deadline.
-        let ms = remaining
-            .as_nanos()
-            .div_ceil(1_000_000)
-            .min(i32::MAX as u128) as i32;
-        // SAFETY: one valid pollfd for the pidfd owned above.
-        let rc = unsafe { libc::poll(&mut pollfd, 1, ms) };
-        if rc > 0 {
-            return ExitEvent::Exited;
-        }
-        if rc == 0 {
-            if Instant::now() < deadline {
-                continue;
-            }
-            return ExitEvent::TimedOut;
-        }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return ExitEvent::Unavailable;
-        }
-    }
+    execution::event(pid, timeout)
 }
 
 /// kqueue can report EV_ERROR as an event; only NOTE_EXIT confirms death.
@@ -4225,7 +4124,7 @@ mod tests {
         }
 
         std::fs::write(vm.join("cgroup.events"), "populated 0\n").unwrap();
-        place_in_cgroup(root.path(), 2, 1024, true, false).unwrap();
+        cgroup::place(root.path(), std::process::id() as i32, 2, 1024, true, false).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(vm.join("cpu.max")).expect("read boot CPU quota"),

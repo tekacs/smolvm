@@ -15,6 +15,7 @@ use smolvm::db::SmolvmDb;
 use smolvm::network::NetworkBackend;
 use smolvm::secrets::SecretRef;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+#[cfg(test)]
 use smolvm_protocol::ImageInfo;
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -229,227 +230,26 @@ pub fn print_output_and_exit(
 // Init runner
 // ============================================================================
 
-/// Run a machine's `init` commands list against the agent.
-///
-/// Branches on `image`:
-///
-/// - `Some(img)`: each command runs *inside* the container's rootfs via
-///   `client.run_non_interactive`. `record_mounts` are bind-mounted into
-///   the container (so `[dev].volumes` like `.:/app` are visible to init,
-///   not just to later `machine exec` calls). `overlay_id` ensures
-///   filesystem changes (e.g. `pacman -Syu` package installs) persist
-///   across this init invocation and into future `machine exec` calls —
-///   matches the convention `machine exec` already uses
-///   (`src/cli/machine.rs:750`).
-///
-/// - `None`: each command runs in the agent's bare VM filesystem via
-///   `client.vm_exec`. There's no container, so `record_mounts` and
-///   `overlay_id` are unused on this branch.
-///
-pub(crate) struct InitRunContext<'a> {
-    pub(crate) image: Option<&'a str>,
-    pub(crate) image_info: Option<&'a ImageInfo>,
-    pub(crate) env: &'a [(String, String)],
-    pub(crate) workdir: Option<&'a str>,
-    pub(crate) record_mounts: &'a [(String, String, bool)],
-    pub(crate) overlay_id: &'a str,
-}
+use smolvm::workload::init::Context as InitRunContext;
+#[cfg(test)]
+use smolvm::workload::{
+    defaults::{
+        merge as merge_env_overrides, resolve as resolve_image_runtime_defaults,
+        Defaults as ImageRuntimeDefaults,
+    },
+    init::{argv as init_argv, failure as format_init_failure, image as build_init_run_config},
+};
 
-/// On the first non-zero exit, returns an error containing the command
-/// index, exit code, and any stdout/stderr the command produced.
-/// **Both** streams are surfaced because package managers often write
-/// the actual failure reason to stdout (`pacman`'s "target not found",
-/// `apt`'s resolver diagnostics) — surfacing only stderr would leave
-/// the operator with an exit code and no explanation. The caller is
-/// responsible for stopping the VM if appropriate.
+/// CLI output policy over the shared trusted initialization operation.
 pub(crate) fn run_init_commands(
     client: &mut smolvm::agent::AgentClient,
     init: &[String],
     context: InitRunContext<'_>,
 ) -> smolvm::Result<()> {
-    if init.is_empty() {
-        return Ok(());
+    if !init.is_empty() {
+        println!("Running {} init command(s)...", init.len());
     }
-    println!("Running {} init command(s)...", init.len());
-    for (i, cmd) in init.iter().enumerate() {
-        if let Some(image) = context.image {
-            let defaults = resolve_image_runtime_defaults(
-                context.image_info,
-                context.env,
-                context.workdir,
-                None,
-            );
-            let config = build_init_run_config(
-                image,
-                cmd,
-                &defaults,
-                context.record_mounts,
-                context.overlay_id,
-            )
-            .with_tty(true);
-            // Interactive run streams the command's output live so the user sees
-            // progress (a slow compile, apt-get, etc.). The output isn't buffered
-            // here, so on a non-zero exit we report just the code — the detail was
-            // already printed above. Not checking the exit code would silently
-            // ignore a failed init command (e.g. a broken `apt install`).
-            let exit_code = client.run_interactive(config)?;
-            if exit_code != 0 {
-                return Err(smolvm::Error::agent(
-                    "init",
-                    format_init_failure(i, exit_code, "", ""),
-                ));
-            }
-        } else {
-            let (exit_code, stdout, stderr) = client.vm_exec(
-                init_argv(cmd),
-                context.env.to_vec(),
-                context.workdir.map(|s| s.to_string()),
-                None,
-                None,
-            )?;
-            if exit_code != 0 {
-                // Init output is generally text — lossy conversion is fine for
-                // error messages. Binary init output isn't a real use case.
-                return Err(smolvm::Error::agent(
-                    "init",
-                    format_init_failure(
-                        i,
-                        exit_code,
-                        &String::from_utf8_lossy(&stdout),
-                        &String::from_utf8_lossy(&stderr),
-                    ),
-                ));
-            }
-        };
-    }
-    Ok(())
-}
-
-/// Wrap a single init command line in `sh -c` argv form. Init commands
-/// are user-supplied shell snippets (e.g. `"pacman -Sy && pacman -S git"`)
-/// — we intentionally route them through `sh` so operators can use shell
-/// features (`&&`, `|`, env expansion) without quoting gymnastics.
-fn init_argv(cmd: &str) -> Vec<String> {
-    vec!["sh".into(), "-c".into(), cmd.to_string()]
-}
-
-/// Resolve effective env/workdir for image-backed execution.
-///
-/// Image metadata provides the baseline defaults. Explicit values from the
-/// CLI/Smolfile/persisted machine config override those defaults by key, while
-/// workdir uses the explicit value when present and otherwise falls back to the
-/// image's `WorkingDir`. Image `User` flows through unchanged because there is
-/// no CLI or persisted override for it today.
-pub(crate) struct ImageRuntimeDefaults {
-    pub(crate) env: Vec<(String, String)>,
-    pub(crate) workdir: Option<String>,
-    pub(crate) user: Option<String>,
-}
-
-pub(crate) fn resolve_image_runtime_defaults(
-    image_info: Option<&ImageInfo>,
-    env: &[(String, String)],
-    explicit_workdir: Option<&str>,
-    explicit_user: Option<&str>,
-) -> ImageRuntimeDefaults {
-    let mut resolved_env = Vec::new();
-
-    if let Some(image_info) = image_info {
-        for spec in &image_info.env {
-            if let Some((key, value)) = smolvm::util::parse_env_spec(spec) {
-                apply_env_override(&mut resolved_env, key, value);
-            }
-        }
-    }
-
-    resolved_env = merge_env_overrides(&resolved_env, env);
-
-    let workdir = explicit_workdir
-        .map(str::to_string)
-        .or_else(|| image_info.and_then(|info| info.workdir.clone()));
-
-    // An explicit user wins over the image's USER, exactly as `docker run
-    // --user` does; without one the image default applies, and without that
-    // the agent runs the workload as root.
-    let user = explicit_user
-        .map(str::to_string)
-        .or_else(|| image_info.and_then(|info| info.user.clone()));
-
-    ImageRuntimeDefaults {
-        env: resolved_env,
-        workdir,
-        user,
-    }
-}
-
-pub(crate) fn merge_env_overrides(
-    base_env: &[(String, String)],
-    overrides: &[(String, String)],
-) -> Vec<(String, String)> {
-    let mut env = base_env.to_vec();
-    for (key, value) in overrides {
-        apply_env_override(&mut env, key.clone(), value.clone());
-    }
-    env
-}
-
-fn apply_env_override(env: &mut Vec<(String, String)>, key: String, value: String) {
-    env.retain(|(existing, _)| existing != &key);
-    env.push((key, value));
-}
-
-/// The account init commands run as: root, named explicitly. A run request
-/// with no user takes the image's `USER`, which is right for a workload but
-/// not for provisioning, so init cannot simply leave the field empty.
-const INIT_USER: &str = "0";
-
-/// Build the `RunConfig` an image-based init command runs under.
-///
-/// Init is provisioning, so it runs as root, like a Dockerfile `RUN` line or
-/// cloud-init: the image's `USER` and the machine's `user` describe who the
-/// workload runs as, not who sets the machine up. The image's env and
-/// workdir still apply. A step that must run as the workload account says so
-/// itself (`su app -c '…'`), as it would in a Dockerfile.
-///
-/// Pure function so the *shape* of the request (overlay ID, mount tags,
-/// env, workdir, the `sh -c` wrap) can be unit-tested without mocking
-/// `AgentClient`. Any of these silently regressing — e.g. mounts not
-/// flowing through, or overlay ID drifting from the machine name —
-/// would leave init working but `machine exec` no longer seeing init's
-/// effects, exactly the class of bug that would lurk for months.
-fn build_init_run_config(
-    image: &str,
-    cmd: &str,
-    defaults: &ImageRuntimeDefaults,
-    record_mounts: &[(String, String, bool)],
-    overlay_id: &str,
-) -> smolvm::agent::RunConfig {
-    let mounts = crate::cli::parsers::record_mounts_to_runconfig_bindings(record_mounts);
-    smolvm::agent::RunConfig::new(image, init_argv(cmd))
-        .with_env(defaults.env.clone())
-        .with_workdir(defaults.workdir.clone())
-        .with_user(Some(INIT_USER.to_string()))
-        .with_mounts(mounts)
-        .with_persistent_overlay(Some(overlay_id.to_string()))
-}
-
-/// Compose the user-facing init-failure message. Pure function — split
-/// out for testability and so the formatting choice (which stream goes
-/// in which order, separators, trimming) is in one place.
-fn format_init_failure(index: usize, exit_code: i32, stdout: &str, stderr: &str) -> String {
-    let so = stdout.trim();
-    let se = stderr.trim();
-    let suffix = match (so, se) {
-        ("", "") => String::new(),
-        (so, "") => format!(": {}", so),
-        ("", se) => format!(": {}", se),
-        // Both populated: keep stderr first (canonical error channel)
-        // but include stdout because `pacman`/`apt`/`dnf` often put the
-        // real reason there. Single line, semicolon-separated, so the
-        // message stays grep-friendly.
-        (so, se) => format!(": {}; stdout: {}", se, so),
-    };
-    format!("init[{}] failed (exit {}){}", index, exit_code, suffix)
+    smolvm::workload::init::run(client, init, context, true)
 }
 
 // ============================================================================

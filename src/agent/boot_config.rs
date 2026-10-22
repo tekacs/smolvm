@@ -59,6 +59,10 @@ pub struct BootConfig {
     /// carried into the boot subprocess and applied by the launcher.
     #[serde(default)]
     pub published_sockets: Vec<crate::config::PublishedSocketConfig>,
+    /// Engine-owned allocation, recorded with containment before boot admission.
+    #[cfg(target_os = "linux")]
+    #[serde(default)]
+    pub endpoints: Option<crate::process::sockets::Allocation>,
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     #[serde(default)]

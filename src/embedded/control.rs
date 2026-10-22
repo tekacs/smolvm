@@ -33,6 +33,9 @@ pub struct MachineSpec {
     /// Workload command overriding the image entrypoint/CMD. Empty preserves
     /// the image defaults, matching the CLI and REST create APIs.
     pub command: Vec<String>,
+    /// Trusted guest-root provisioning commands, run before the workload user.
+    /// Commands must tolerate replay after lost initialization acknowledgements.
+    pub init: Vec<String>,
     /// Hostnames permitted by the TSI egress filter. Kept outside
     /// `VmResources` because hostname rules are persisted separately from the
     /// resolved CIDRs and refreshed by the DNS filter at runtime.
@@ -109,6 +112,7 @@ impl MachineSpec {
         // process reconnecting boots the guest with the VMX it was created with.
         record.nested_virt = self.resources.nested_virt.then_some(true);
         record.image = self.image.clone();
+        record.init = self.init.clone();
         record.labels = self.labels.clone();
         record.ephemeral = !self.persistent;
         record.forkable = self.forkable;
@@ -824,8 +828,22 @@ pub(crate) fn delete_vm_locked(db: &SmolvmDb, name: &str) -> Result<()> {
             ),
         ));
     }
-    if db.get_vm(name)?.is_none() {
-        return Err(Error::vm_not_found(name));
+    let record = get_record(db, name)?;
+    let data_dir = crate::agent::vm_data_dir(name);
+    #[cfg(target_os = "linux")]
+    {
+        crate::process::sockets::protect(&data_dir, &record.published_sockets)?;
+        if let Some(execution) =
+            crate::process::execution::Execution::load(&data_dir.join("agent.pid"))?
+        {
+            execution.reclaim()?;
+        }
+    }
+    if record.is_process_alive() {
+        return Err(Error::agent(
+            "delete machine",
+            "machine process is still alive",
+        ));
     }
     // A stopped or crashed branch source can still own the processes holding
     // its forked RAM. Stop them while the record and their manifests exist, as
@@ -835,7 +853,6 @@ pub(crate) fn delete_vm_locked(db: &SmolvmDb, name: &str) -> Result<()> {
         return Err(Error::vm_not_found(name));
     };
 
-    let data_dir = crate::agent::vm_data_dir(name);
     // Release this machine's per-VM uid (root launches only) before the dir
     // holding its record is removed.
     crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), &data_dir);

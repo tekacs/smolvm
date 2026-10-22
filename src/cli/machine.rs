@@ -2129,7 +2129,7 @@ impl RunCmd {
             if let Err(e) = vm_common::run_init_commands(
                 &mut client,
                 &params.init,
-                vm_common::InitRunContext {
+                smolvm::workload::init::Context {
                     image: image.as_deref(),
                     image_info: image_info.as_ref(),
                     env: &init_env,
@@ -2180,7 +2180,7 @@ impl RunCmd {
 
         // Two modes: with image or bare VM (no image)
         if let Some(ref img) = image {
-            let defaults = vm_common::resolve_image_runtime_defaults(
+            let defaults = smolvm::workload::defaults::resolve(
                 image_info.as_ref(),
                 &env,
                 params.workdir.as_deref(),
@@ -3992,8 +3992,8 @@ impl ExecCmd {
                     None
                 }
             };
-            let configured_env = vm_common::merge_env_overrides(&record_env, &env);
-            let defaults = vm_common::resolve_image_runtime_defaults(
+            let configured_env = smolvm::workload::defaults::merge(&record_env, &env);
+            let defaults = smolvm::workload::defaults::resolve(
                 image_info.as_ref(),
                 &configured_env,
                 workdir.as_deref(),
@@ -4087,7 +4087,7 @@ impl ExecCmd {
                 );
             }
             // Merge record env + resolved secrets with CLI env, same as image path.
-            let env = vm_common::merge_env_overrides(&record_env, &env);
+            let env = smolvm::workload::defaults::merge(&record_env, &env);
             if self.detach {
                 // Spawn detached in the guest root netns — no setsid/killpg, so
                 // a daemon (e.g. a server on a published port) survives. TSI sees

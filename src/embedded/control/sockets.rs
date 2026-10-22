@@ -6,6 +6,7 @@ fn spec() -> MachineSpec {
         name: "socket-service".into(),
         persistent: true,
         detached: true,
+        init: vec!["install -d -m 0700 -o 1000 -g 1000 /workspace/service".into()],
         published_sockets: vec![
             PublishedSocketConfig {
                 direction: SocketDirection::Expose,
@@ -34,6 +35,8 @@ fn both_socket_directions_survive_registry_reopen_and_launch_reconstruction() {
     let db = SmolvmDb::open_at(&path).unwrap();
     let record = get_record(&db, &requested.name).unwrap();
     assert_eq!(record.published_sockets, requested.published_sockets);
+    assert_eq!(record.init, requested.init);
+    assert!(!record.init_completed);
     let features = merge_record_launch_features(&record, LaunchFeatures::default());
     assert_eq!(features.published_sockets, requested.published_sockets);
     assert_eq!(features.watch_parent, Some(false));

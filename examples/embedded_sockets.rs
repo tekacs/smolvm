@@ -39,6 +39,8 @@ mod linux {
         env: Vec<(String, String)>,
         #[serde(default)]
         command: Vec<String>,
+        #[serde(default)]
+        init: Vec<String>,
     }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -154,6 +156,7 @@ mod linux {
                                 name: settings.name.clone(),
                                 image: Some(image),
                                 command: settings.command.clone(),
+                                init: settings.init.clone(),
                                 published_sockets: settings.sockets.clone(),
                                 persistent: true,
                                 detached: true,
@@ -184,7 +187,11 @@ mod linux {
                 }
                 Ok(match runtime.machine_record(&settings.name)? {
                     Some(record) => {
-                        json!({"present":true,"pid":record.pid,"start":record.pid_start_time,"network":record.network,"detached":record.detached,"directory":smolvm::agent::vm_data_dir(&settings.name)})
+                        let execution = runtime.execution(&settings.name)?
+                            .map(|identity| -> Result<Value, std::io::Error> {
+                                Ok(json!({"pid":identity.pid(),"start":identity.started(),"exited":identity.exited()?}))
+                            }).transpose()?;
+                        json!({"present":true,"pid":record.pid,"start":record.pid_start_time,"network":record.network,"detached":record.detached,"directory":smolvm::agent::vm_data_dir(&settings.name),"execution":execution})
                     }
                     None => json!({"present":false}),
                 })

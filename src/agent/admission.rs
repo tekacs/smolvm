@@ -1,5 +1,5 @@
-//! Publish a boot process's identity before permitting it to enter the VM.
-
+//! Establish containment and publish identity before permitting guest disk access.
+use super::boot_config::BootConfig;
 use crate::{Error, Result};
 use std::{
     io::{Read, Write},
@@ -30,7 +30,6 @@ pub(crate) fn wait() -> Result<()> {
     Ok(())
 }
 
-/// The launcher identity is captured before spawn, not after possible reparenting.
 #[cfg(unix)]
 pub(crate) fn parent() -> Result<i32> {
     std::env::var("SMOLVM_BOOT_PARENT_ID")
@@ -40,10 +39,45 @@ pub(crate) fn parent() -> Result<i32> {
         .ok_or_else(|| Error::agent("watch boot parent", "missing launcher identity"))
 }
 
-/// A lost controller before this write leaves the helper blocked; EOF refuses boot.
-pub(super) fn release(child: &mut Child, path: &Path) -> Result<()> {
+/// The only release operation: containment, durable identity, then permission.
+/// Any error kills/reaps this unreaped Child, never a looked-up numeric PID.
+pub(super) fn admit<'a>(
+    child: &mut Child,
+    path: &Path,
+    config: &BootConfig,
+    name: Option<&'a str>,
+    memfd: bool,
+) -> Result<Option<&'a str>> {
+    let pid = child.id() as i32;
+    let mut scope = None;
+    let result = release(child, || {
+        #[cfg(target_os = "linux")]
+        {
+            let (group, adopted) = place(pid, config, name, memfd)?;
+            scope = adopted;
+            crate::process::execution::record(path, pid, group, config.endpoints.clone())?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (config, name, memfd, &mut scope);
+            record(path, pid)?;
+        }
+        Ok(())
+    });
+    // The helper never ran guest code if admission failed. Do not stop a
+    // same-name scope unless this operation actually adopted this child into it.
+    #[cfg(target_os = "linux")]
+    if result.is_err() && child.try_wait().ok().flatten().is_some() {
+        if let Some(name) = scope {
+            let _ = crate::systemd_scope::stop_scope(name);
+        }
+    }
+    result.map(|()| scope)
+}
+
+fn release(child: &mut Child, prepare: impl FnOnce() -> Result<()>) -> Result<()> {
     let admitted = (|| {
-        record(path, child.id() as i32)?;
+        prepare()?;
         let mut pipe = child
             .stdin
             .take()
@@ -52,100 +86,81 @@ pub(super) fn release(child: &mut Child, path: &Path) -> Result<()> {
         Ok(())
     })();
     if admitted.is_err() {
-        // This unreaped Child is ours; no lookup or reused PID can select another process.
         let _ = child.kill();
         let _ = child.wait();
     }
     admitted
 }
 
+#[cfg(target_os = "linux")]
+fn place<'a>(
+    pid: i32,
+    config: &BootConfig,
+    name: Option<&'a str>,
+    memfd: bool,
+) -> Result<(Option<crate::process::cgroup::Cgroup>, Option<&'a str>)> {
+    use crate::{
+        embedded::bundle::boot_var,
+        process::{cgroup, vmm_memory_budget},
+    };
+    let root = boot_var("SMOLVM_CGROUP_ROOT");
+    let scoped = boot_var("SMOLVM_VM_USE_SCOPE").is_some();
+    if root.is_some() && scoped {
+        return Err(Error::agent(
+            "place boot",
+            "conflicting containment policies",
+        ));
+    }
+    if let Some(root) = root {
+        let group = cgroup::place(
+            Path::new(&root),
+            pid,
+            config.resources.cpus,
+            config.resources.memory_mib,
+            config.cuda,
+            memfd,
+        )?;
+        return Ok((Some(group), None));
+    }
+    if !scoped {
+        return Ok((None, None));
+    }
+    let name = name.ok_or_else(|| Error::agent("place boot", "scope requires named machine"))?;
+    let budget = vmm_memory_budget(config.resources.memory_mib, config.cuda, memfd);
+    let caps = crate::systemd_scope::ScopeCaps {
+        memory_max_bytes: Some(budget.max_bytes),
+        memory_high_bytes: Some(budget.high_bytes),
+        cpu_quota_usec_per_sec: Some(u64::from(config.resources.cpus.max(1)) * 1_000_000),
+        tasks_max: Some(1024),
+    };
+    crate::systemd_scope::adopt_into_scope(name, pid, &caps)?;
+    let group = cgroup::Cgroup::scope(name, pid)?;
+    Ok((Some(group), Some(name)))
+}
+
+/// Legacy/uncontained failed-launch record. Never overwrite contained evidence.
 pub(super) fn record(path: &Path, pid: i32) -> Result<()> {
-    let start = crate::process::process_start_time(pid)
-        .ok_or_else(|| Error::agent("record boot", "process incarnation is unavailable"))?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::agent("record boot", "missing identity directory"))?;
-    let mut candidate = tempfile::NamedTempFile::new_in(parent)?;
-    writeln!(candidate, "{pid}\n{start}")?;
     #[cfg(target_os = "linux")]
-    writeln!(
-        candidate,
-        "{}",
-        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim()
-    )?;
-    candidate.as_file().sync_all()?;
-    candidate.persist(path).map_err(|error| error.error)?;
-    #[cfg(unix)]
-    std::fs::File::open(parent)?.sync_all()?;
+    {
+        crate::process::execution::record(path, pid, None, None)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let start = crate::process::process_start_time(pid)
+            .ok_or_else(|| Error::agent("record boot", "process incarnation is unavailable"))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::agent("record boot", "missing identity directory"))?;
+        let mut candidate = tempfile::NamedTempFile::new_in(parent)?;
+        writeln!(candidate, "{pid}\n{start}")?;
+        candidate.as_file().sync_all()?;
+        candidate.persist(path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    fn child(root: &Path) -> Child {
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .args([
-                "--exact",
-                "agent::admission::tests::child_entry",
-                "--ignored",
-            ])
-            .env("BOOT_TEST_ROOT", root)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        configure(&mut command);
-        command.spawn().unwrap()
-    }
-
-    #[test]
-    #[ignore = "entrypoint launched explicitly by admission tests"]
-    fn child_entry() {
-        let root = std::env::var_os("BOOT_TEST_ROOT").unwrap();
-        if wait().is_ok() {
-            assert_eq!(parent().unwrap(), unsafe { libc::getppid() });
-            std::fs::write(Path::new(&root).join("admitted"), b"yes").unwrap();
-        }
-    }
-
-    #[test]
-    fn closed_controller_pipe_never_admits_boot() {
-        let root = tempfile::tempdir().unwrap();
-        let mut boot = child(root.path());
-        drop(boot.stdin.take());
-        assert!(boot.wait().unwrap().success());
-        assert!(!root.path().join("admitted").exists());
-    }
-
-    #[test]
-    fn failed_identity_publication_never_admits_boot() {
-        let root = tempfile::tempdir().unwrap();
-        let mut boot = child(root.path());
-        assert!(release(&mut boot, &root.path().join("missing/agent.pid")).is_err());
-        assert!(!root.path().join("admitted").exists());
-    }
-
-    #[test]
-    fn admitted_child_has_durable_exact_identity() {
-        let root = tempfile::tempdir().unwrap();
-        let mut boot = child(root.path());
-        let pid = boot.id();
-        let start = crate::process::process_start_time(pid as i32).unwrap();
-        let identity = root.path().join("agent.pid");
-        release(&mut boot, &identity).unwrap();
-        assert!(boot.wait().unwrap().success());
-        assert!(root.path().join("admitted").exists());
-        let stored = std::fs::read_to_string(identity).unwrap();
-        let mut lines = stored.lines();
-        assert_eq!(lines.next().unwrap(), pid.to_string());
-        assert_eq!(lines.next().unwrap(), start.to_string());
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            lines.next().unwrap(),
-            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-                .unwrap()
-                .trim()
-        );
-    }
-}
+#[path = "admission/tests.rs"]
+mod tests;

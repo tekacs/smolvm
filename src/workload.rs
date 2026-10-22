@@ -6,6 +6,9 @@
 //! it boots a bare agent VM whose published ports forward to nothing. Keeping
 //! the launch here, in the lib, is what stops front-ends from drifting apart.
 
+pub mod defaults;
+pub mod init;
+
 use crate::agent::{AgentClient, RunConfig, WorkloadTarget};
 use crate::config::VmRecord;
 
