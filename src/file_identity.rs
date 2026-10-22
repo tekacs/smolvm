@@ -6,7 +6,7 @@ use std::{fs::File, os::unix::fs::MetadataExt};
 pub(crate) struct Identity {
     pub(crate) dev: u64,
     pub(crate) ino: u64,
-    len: u64,
+    pub(crate) len: u64,
     mtime: (i64, i64),
     ctime: (i64, i64),
 }
