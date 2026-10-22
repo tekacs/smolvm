@@ -2353,11 +2353,7 @@ impl AgentManager {
     /// Preserve process identity and the launch lock unless teardown succeeds.
     fn abort_failed_launch(&self, pid: i32) -> Result<()> {
         self.inner.lock().child = Some(ChildProcess::new(pid));
-        let identity = match process::process_start_time(pid) {
-            Some(start) => format!("{pid}\n{start}"),
-            None => pid.to_string(),
-        };
-        if let Err(error) = std::fs::write(&self.pid_file, identity) {
+        if let Err(error) = super::admission::record(&self.pid_file, pid) {
             tracing::warn!(pid, %error, "could not persist failed launch identity; retaining child handle");
         }
         process::stop_vm_process(pid, Duration::ZERO, process::VM_SIGKILL_TIMEOUT)?;
@@ -2391,14 +2387,8 @@ impl AgentManager {
         // Write running config (for future CLI invocations to detect config changes)
         self.save_running_config(mounts, ports, resources);
 
-        // Write PID file with start time for PID reuse detection
-        let pid_content = match process::process_start_time(child_pid) {
-            Some(t) => format!("{}\n{}", child_pid, t),
-            None => child_pid.to_string(),
-        };
-        if let Err(e) = std::fs::write(&self.pid_file, pid_content) {
-            tracing::warn!(error = %e, "failed to write PID file");
-        }
+        // The subprocess admission pipe was released only after its identity was
+        // fsynced. Do not truncate that durable record during readiness bookkeeping.
 
         // Wait for the agent to be ready
         match self.wait_for_ready() {
@@ -3134,9 +3124,11 @@ impl AgentManager {
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
             cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
         }
-        let child = cmd
+        super::admission::configure(&mut cmd);
+        let mut child = cmd
             .spawn()
             .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
+        super::admission::release(&mut child, &self.pid_file)?;
 
         let child_pid = child.id() as i32;
         // Register the detached VM PID for the serve supervisor's selective

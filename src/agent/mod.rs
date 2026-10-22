@@ -3,6 +3,7 @@
 //! This module manages the agent VM lifecycle and provides a client
 //! for communicating with the smolvm-agent via vsock.
 
+pub(crate) mod admission;
 pub mod boot_config;
 mod client;
 pub mod display;

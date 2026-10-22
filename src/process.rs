@@ -5037,13 +5037,19 @@ mod tests {
         }
     }
 
-    /// Landlock must actually *deny* — after restricting to `/usr` only, opening
-    /// an ungranted path (`/etc/hostname`) must fail with EACCES. Runs in a forked
-    /// child so the restriction doesn't affect the test runner.
+    /// Landlock must deny an existing ungranted file with EACCES. Use an owned
+    /// fixture rather than assuming the host has /etc/hostname. The restriction
+    /// runs in a child so it cannot affect the test runner.
     #[cfg(target_os = "linux")]
     #[test]
     fn landlock_denies_ungranted_path() {
+        use std::os::unix::ffi::OsStrExt;
         use std::path::PathBuf;
+        let root = tempfile::tempdir().unwrap();
+        let denied = root.path().join("ungranted");
+        std::fs::write(&denied, b"must be denied").unwrap();
+        assert_eq!(std::fs::read(&denied).unwrap(), b"must be denied");
+        let path = std::ffi::CString::new(denied.as_os_str().as_bytes()).unwrap();
         unsafe {
             let pid = libc::fork();
             assert!(pid >= 0, "fork failed");
@@ -5054,8 +5060,7 @@ mod tests {
                 if restrict_filesystem(&ro, &[]).is_err() {
                     libc::_exit(3); // Landlock unavailable on this kernel — tolerate.
                 }
-                // /etc is NOT granted -> opening it must be denied.
-                let path = c"/etc/hostname";
+                // The existing fixture is outside /usr and must be denied.
                 let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
                 if fd < 0 {
                     let err = *libc::__errno_location();
@@ -5065,6 +5070,10 @@ mod tests {
             }
             let mut status: libc::c_int = 0;
             libc::waitpid(pid, &mut status, 0);
+            assert!(
+                libc::WIFEXITED(status),
+                "child did not exit normally: {status}"
+            );
             let code = libc::WEXITSTATUS(status);
             assert!(
                 code == 0 || code == 3,

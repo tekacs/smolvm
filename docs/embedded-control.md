@@ -37,6 +37,15 @@ successful launch identity, and when attaching to that detached record. Explicit
 stop still stops it. Operating-system service policy remains independent: a
 service configured to kill its entire cgroup can kill detached VMs too.
 
+## Launch admission
+
+The matched helper waits on a private stdin pipe before opening boot configuration
+or guest disks. The parent writes the child's PID, start time and Linux boot ID
+through an fsynced atomic identity file, then releases that pipe. Controller death
+before release closes the pipe and the helper refuses boot. Controller death after
+release leaves an inspectable incarnation even if guest readiness never completed.
+The early identity record is not rewritten during readiness bookkeeping.
+
 ## Resource and exit evidence
 
 Linux delegated-cgroup placement establishes limits before joining the VM leaf.

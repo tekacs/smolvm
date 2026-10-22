@@ -76,6 +76,9 @@ fn open_boot_disk<K: DiskType>(path: &Path, size_gb: u64) -> crate::Result<VmDis
 /// Reads the boot config from the given path, sets up libkrun, and calls
 /// `krun_start_enter` which blocks forever (or until the VM exits).
 pub fn run(config_path: PathBuf) -> crate::Result<()> {
+    // The matched controller fsyncs our process identity before releasing this pipe.
+    // EOF means it died before admission; never open guest disks in that case.
+    crate::agent::admission::wait()?;
     let t_proc = std::time::Instant::now();
 
     // --- Parent-death watchdog ---------------------------------------------
