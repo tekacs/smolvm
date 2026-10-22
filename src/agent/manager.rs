@@ -2192,6 +2192,7 @@ impl AgentManager {
         mounts: &[HostMount],
         ports: &[PortMapping],
         resources: VmResources,
+        observer: &crate::progress::Observer,
     ) -> Result<()> {
         // Refuse to (re)launch a fork base while clones depend on it. Clones
         // CoW-read this VM's disks by path; re-running it would reopen them
@@ -2312,16 +2313,23 @@ impl AgentManager {
             ));
         }
 
-        // Pre-format storage and overlay disks in parallel
+        // Pre-format storage and overlay disks in parallel. Observation does not
+        // change the existing best-effort failure policy.
         {
+            observer.emit(
+                crate::progress::Phase::DiskFormat,
+                crate::progress::Mark::Started,
+            );
             let storage_disk = &self.storage_disk;
             let overlay_disk = &self.overlay_disk;
-            std::thread::scope(|s| {
+            let failed = std::thread::scope(|s| {
                 let storage_handle = s.spawn(|| storage_disk.ensure_formatted());
                 let overlay_result = overlay_disk.ensure_formatted();
-                if let Err(e) = storage_handle.join().unwrap_or_else(|_| {
+                let storage_result = storage_handle.join().unwrap_or_else(|_| {
                     Err(crate::Error::storage("format storage", "thread panicked"))
-                }) {
+                });
+                let failed = storage_result.is_err() || overlay_result.is_err();
+                if let Err(e) = storage_result {
                     tracing::warn!(
                         error = %e,
                         "failed to pre-format disk on host"
@@ -2333,7 +2341,16 @@ impl AgentManager {
                         "failed to pre-format overlay disk on host"
                     );
                 }
+                failed
             });
+            observer.emit(
+                crate::progress::Phase::DiskFormat,
+                if failed {
+                    crate::progress::Mark::Failed
+                } else {
+                    crate::progress::Mark::Completed
+                },
+            );
         }
 
         // Clean up old socket and this VM's stale (per-VM) readiness marker.
@@ -2404,6 +2421,7 @@ impl AgentManager {
         mounts: &[HostMount],
         ports: &[PortMapping],
         resources: &VmResources,
+        observer: &crate::progress::Observer,
     ) -> Result<()> {
         let boot_start = std::time::Instant::now();
 
@@ -2420,7 +2438,7 @@ impl AgentManager {
         // fsynced. Do not truncate that durable record during readiness bookkeeping.
 
         // Wait for the agent to be ready
-        match self.wait_for_ready() {
+        match observer.around(crate::progress::Phase::AgentReady, || self.wait_for_ready()) {
             Ok(_) => {
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Running;
@@ -2491,6 +2509,7 @@ impl AgentManager {
         mut features: launcher::LaunchFeatures,
     ) -> Result<()> {
         use super::boot_config::BootConfig;
+        let observer = features.observer.clone();
 
         let t_launch = Instant::now();
 
@@ -2630,7 +2649,7 @@ impl AgentManager {
         // after metal measurements showed disk-prep at ~1ms (NVMe + qcow2 thin
         // clone) with flat boot latency from 8 → 32 concurrent boots — the gate
         // was non-binding and only serialized needlessly.
-        self.prepare_for_launch(&mounts, &ports, resources)?;
+        self.prepare_for_launch(&mounts, &ports, resources, &observer)?;
         tracing::info!(
             elapsed_ms = t_launch.elapsed().as_millis(),
             "boot: disks ready"
@@ -3163,11 +3182,13 @@ impl AgentManager {
             cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
         }
         super::admission::configure(&mut cmd);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
-        let adopted_scope =
-            super::admission::admit(&mut child, &self.pid_file, &config, self.name(), fork_memfd)?;
+        let mut child = observer.around(crate::progress::Phase::HelperSpawn, || {
+            cmd.spawn()
+                .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))
+        })?;
+        let adopted_scope = observer.around(crate::progress::Phase::ExecutionAdmission, || {
+            super::admission::admit(&mut child, &self.pid_file, &config, self.name(), fork_memfd)
+        })?;
         #[cfg(not(target_os = "linux"))]
         let _ = adopted_scope;
 
@@ -3201,7 +3222,8 @@ impl AgentManager {
             "boot: subprocess spawned"
         );
 
-        let launched = self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config);
+        let launched =
+            self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config, &observer);
         #[cfg(target_os = "linux")]
         if let (Err(_), Some(name)) = (&launched, adopted_scope) {
             release_failed_launch_scope(name, child_pid);
@@ -4462,7 +4484,12 @@ mod tests {
         // Fresh manager (Stopped), no responding agent, but a live recorded PID.
         // This must fail before rootfs validation or disk formatting.
         let error = manager
-            .prepare_for_launch(&[], &[], VmResources::default())
+            .prepare_for_launch(
+                &[],
+                &[],
+                VmResources::default(),
+                &crate::progress::Observer::default(),
+            )
             .unwrap_err();
         assert!(error.to_string().contains("refusing a second launch"));
         assert_eq!(

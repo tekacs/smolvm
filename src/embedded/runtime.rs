@@ -532,6 +532,25 @@ impl EmbeddedRuntime {
         name: &str,
         interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     ) -> Result<()> {
+        self.start_observed(name, interceptor, crate::progress::Observer::default())
+    }
+
+    /// Start with explicit host phase observation. Events carry no clocks or
+    /// payloads; an already-running machine does not invent cold-start events.
+    pub fn start_machine_observed(
+        &self,
+        name: &str,
+        observer: crate::progress::Observer,
+    ) -> Result<()> {
+        self.start_observed(name, None, observer)
+    }
+
+    fn start_observed(
+        &self,
+        name: &str,
+        interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+        observer: crate::progress::Observer,
+    ) -> Result<()> {
         self.with_name_lock(name, || {
             if control::get_record(&self.db, name)?
                 .paused_checkpoint
@@ -550,10 +569,10 @@ impl EmbeddedRuntime {
                 self.remove_cached_handle(name)?;
             }
 
-            let started = control::start_vm_with_interceptor(&self.db, name, interceptor)?;
+            let started = control::start_observed(&self.db, name, interceptor, observer.clone())?;
             let mut handle = started.handle;
             if started.freshly_started {
-                self.launch_image_workload(name, &mut handle)?;
+                self.launch_observed(name, &mut handle, &observer)?;
             }
             self.insert_handle(name, handle)?;
             Ok(())
@@ -1275,21 +1294,47 @@ impl EmbeddedRuntime {
     }
 
     fn initialize(&self, name: &str, handle: &mut VmHandle) -> Result<()> {
+        self.initialize_observed(name, handle, &crate::progress::Observer::default())
+    }
+
+    fn initialize_observed(
+        &self,
+        name: &str,
+        handle: &mut VmHandle,
+        observer: &crate::progress::Observer,
+    ) -> Result<()> {
         let record = control::get_record(&self.db, name)?;
         if !record.init_completed && (record.image.is_some() || !record.init.is_empty()) {
-            handle.initialize(&record)?;
-            self.db
-                .update_vm_durable(name, |record| record.init_completed = true)?
-                .ok_or_else(|| Error::vm_not_found(name))?;
+            observer.around(crate::progress::Phase::Initialization, || -> Result<()> {
+                handle.initialize(&record)?;
+                self.db
+                    .update_vm_durable(name, |record| record.init_completed = true)?
+                    .ok_or_else(|| Error::vm_not_found(name))?;
+                Ok(())
+            })?;
         }
         Ok(())
     }
 
     fn launch_image_workload(&self, name: &str, handle: &mut VmHandle) -> Result<()> {
+        self.launch_observed(name, handle, &crate::progress::Observer::default())
+    }
+
+    fn launch_observed(
+        &self,
+        name: &str,
+        handle: &mut VmHandle,
+        observer: &crate::progress::Observer,
+    ) -> Result<()> {
         let launched = (|| {
-            self.initialize(name, handle)?;
+            self.initialize_observed(name, handle, observer)?;
             let record = control::get_record(&self.db, name)?;
-            handle.launch_image_workload(name, &record)
+            if record.image.is_none() {
+                return Ok(());
+            }
+            observer.around(crate::progress::Phase::WorkloadLaunch, || {
+                handle.launch_image_workload(name, &record)
+            })
         })();
         if launched.is_err() && handle.stop().is_ok() {
             control::mark_stopped(&self.db, name)?;
@@ -1986,6 +2031,19 @@ mod tests {
             .read()
             .expect("name locks should not be poisoned")
             .is_empty());
+    }
+
+    #[test]
+    fn observed_start_of_missing_machine_has_no_invented_launch_milestones() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let observer =
+            crate::progress::Observer::new(move |event| captured.lock().unwrap().push(event));
+        assert!(runtime
+            .start_machine_observed("missing-observed-machine", observer)
+            .is_err());
+        assert!(events.lock().unwrap().is_empty());
     }
 
     #[test]

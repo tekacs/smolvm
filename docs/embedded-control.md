@@ -79,6 +79,35 @@ explicit `Bundle::boot_env`; unrelated ambient variables are not copied into the
 Read-only template discovery uses `smolvm_pack::assets::existing_template`, while
 ordinary template discovery may still materialize compressed templates.
 
+## Host launch observation
+
+`progress::Observer` receives typed host phase events supplied explicitly to
+`data::image_source::resolve_observed` and
+`EmbeddedRuntime::start_machine_observed`. The observer has no engine clock,
+process-global registration, identifiers, paths, command arguments or payloads.
+The caller stamps callbacks with its own attempt clock and decides where to keep
+them. Callbacks run synchronously; they must not block or re-enter the lifecycle.
+Ordinary entry points use an empty observer and keep their existing behavior.
+
+Archive resolution reports hashing and staging, including an actual cache hit,
+hardlink or completed copy. Launch reports the existing image-seed attempt,
+opening and formatting disks, helper spawn, retained execution admission, agent
+readiness, initialization and the detached-workload launch routine. The seed span
+includes selection, possible builder work and attachment; it is not evidence of a
+cache hit or a pure lookup duration. A completed best-effort seed attempt does not
+assert that a seed was built. A failed phase contains no error text. An interrupted
+phase may have a start without a terminal event.
+
+Helper spawn is reported after the host spawn call succeeds. Admission is reported
+after the retained identity admission operation returns. Agent readiness is the
+host manager's readiness result, not a guest timestamp. A completed workload phase
+means the launch routine returned successfully: an image without a command may be
+skipped, and a launch acknowledgement is not application readiness. Reconnecting
+may still perform and report seed
+checks or disk opening, but does not fabricate a helper spawn, new admission or
+fresh workload launch. No event claims to observe application imports or
+application-specific initialization inside the guest.
+
 ## Detached managers
 
 A persisted detached machine survives both loss of its controller and normal

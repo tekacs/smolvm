@@ -260,6 +260,15 @@ pub(crate) fn start_vm_with_interceptor(
     name: &str,
     interceptor: Option<smolvm_protocol::InterceptEndpoint>,
 ) -> Result<StartedVm> {
+    start_observed(db, name, interceptor, crate::progress::Observer::default())
+}
+
+pub(crate) fn start_observed(
+    db: &SmolvmDb,
+    name: &str,
+    interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+    observer: crate::progress::Observer,
+) -> Result<StartedVm> {
     // A machine with no network cannot pull its registry image in-guest; the
     // host fetches it instead.
     let record = crate::image_store::pin_for_start(
@@ -270,10 +279,19 @@ pub(crate) fn start_vm_with_interceptor(
     )?;
     // A fresh registry-image machine starts on a shared seed of its image, as
     // the CLI and API do, so an SDK create skips the in-guest pull.
+    observer.emit(
+        crate::progress::Phase::SeedAttempt,
+        crate::progress::Mark::Started,
+    );
     crate::image_seed::seed_first_start(name, &record, false, None, None, None);
+    observer.emit(
+        crate::progress::Phase::SeedAttempt,
+        crate::progress::Mark::Completed,
+    );
     let started = launch_from_record(
         &record,
         LaunchFeatures {
+            observer,
             external_interceptor: interceptor,
             ..Default::default()
         },
@@ -398,9 +416,12 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
             features.uid_share_dir = Some(crate::agent::vm_data_dir(g));
         }
     }
-    let manager =
-        AgentManager::for_vm_with_sizes(&record.name, record.storage_gb, record.overlay_gb)
-            .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
+    let manager = features
+        .observer
+        .around(crate::progress::Phase::DiskOpen, || {
+            AgentManager::for_vm_with_sizes(&record.name, record.storage_gb, record.overlay_gb)
+                .map_err(|e| Error::agent("create agent manager", e.to_string()))
+        })?;
 
     let restoring_checkpoint =
         crate::portable_checkpoint::pending_dir(&crate::agent::vm_data_dir(&record.name)).is_some();

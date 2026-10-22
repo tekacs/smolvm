@@ -108,6 +108,7 @@ pub mod pool;
 /// Portable live-checkpoint compatibility and one-shot restore support.
 pub mod portable_checkpoint;
 pub mod process;
+pub mod progress;
 pub mod registry;
 pub mod remote_volume;
 pub mod secrets;

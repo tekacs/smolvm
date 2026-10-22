@@ -15,7 +15,10 @@
 //! - everything else (`alpine`, `repo:tag`, `ghcr.io/owner/repo@sha256:…`) → a
 //!   registry reference, even if a same-named file happens to sit in the cwd.
 
-use crate::{Error, Result};
+use crate::{
+    progress::{Mark, Observer, Phase},
+    Error, Result,
+};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -199,15 +202,21 @@ const ARCHIVE_FILE: &str = "archive.tar";
 /// Both local kinds yield a `packed_layers_dir` to mount and a `local:…`
 /// reference to persist on the machine record.
 pub fn resolve(source: ImageSource) -> Result<ResolvedImage> {
-    match source {
+    resolve_observed(source, &Observer::default())
+}
+
+/// Resolve with explicit metadata-only host phase observation. No path, reference
+/// or archive bytes are passed to the observer, and the engine assigns no clock.
+pub fn resolve_observed(source: ImageSource, observer: &Observer) -> Result<ResolvedImage> {
+    observer.around(Phase::ArchiveResolve, || match source {
         ImageSource::Registry(reference) => Ok(ResolvedImage::Registry(reference)),
         ImageSource::Directory(path) => resolve_directory(&path),
-        ImageSource::Archive(input) => resolve_archive(input),
+        ImageSource::Archive(input) => resolve_archive(input, observer),
         ImageSource::Unsupported { given, hint } => Err(Error::config(
             "image source",
             format!("unsupported image reference '{given}': {hint}"),
         )),
-    }
+    })
 }
 
 fn resolve_directory(path: &Path) -> Result<ResolvedImage> {
@@ -229,12 +238,12 @@ fn resolve_directory(path: &Path) -> Result<ResolvedImage> {
     })
 }
 
-fn resolve_archive(input: ArchiveInput) -> Result<ResolvedImage> {
+fn resolve_archive(input: ArchiveInput, observer: &Observer) -> Result<ResolvedImage> {
     let cache_base = archive_cache_base()?;
     std::fs::create_dir_all(&cache_base)?;
     let hash = match input {
-        ArchiveInput::File(path) => stage_from_file(&path, &cache_base)?,
-        ArchiveInput::Stdin => stage_from_stdin(&cache_base)?,
+        ArchiveInput::File(path) => stage_file(&path, &cache_base, observer)?,
+        ArchiveInput::Stdin => stage_from_stdin(&cache_base, observer)?,
     };
     Ok(ResolvedImage::Local {
         reference: format!("{LOCAL_ARCHIVE_PREFIX}{hash}"),
@@ -243,7 +252,12 @@ fn resolve_archive(input: ArchiveInput) -> Result<ResolvedImage> {
 }
 
 /// Hash an on-disk archive and hardlink (or copy) it into `cache/<hash>/`.
+#[cfg(test)]
 fn stage_from_file(path: &Path, cache_base: &Path) -> Result<String> {
+    stage_file(path, cache_base, &Observer::default())
+}
+
+fn stage_file(path: &Path, cache_base: &Path, observer: &Observer) -> Result<String> {
     let meta = std::fs::metadata(path).map_err(|e| {
         Error::config(
             "--image",
@@ -271,7 +285,7 @@ fn stage_from_file(path: &Path, cache_base: &Path) -> Result<String> {
     if meta.len() > max_archive_bytes() {
         return Err(too_large(meta.len()));
     }
-    let hash = hash_file(path)?;
+    let hash = observer.around(Phase::ArchiveHash, || hash_file(path))?;
     let archive_path = cache_base.join(&hash).join(ARCHIVE_FILE);
     // A cache hit is trusted only if the staged file is still the size we just
     // hashed. `link_or_copy` HARDLINKS the caller's archive when it can, so the
@@ -281,50 +295,63 @@ fn stage_from_file(path: &Path, cache_base: &Path) -> Result<String> {
     // the damaged copy is then reused forever for that content, and every boot
     // fails in the guest with a `manifest.json not found in tar` that points at
     // the user's (valid) archive rather than at the cache. Re-stage instead.
-    let staged_len = std::fs::metadata(&archive_path).ok().map(|m| m.len());
-    if staged_len != Some(meta.len()) {
-        std::fs::create_dir_all(archive_path.parent().expect("hash dir has a parent"))?;
-        // Remove first: the stale entry may be a hardlink to the caller's file,
-        // and linking onto an existing path fails.
-        let _ = std::fs::remove_file(&archive_path);
-        link_or_copy(path, &archive_path)?;
-    }
+    observer.around(Phase::ArchiveStage, || -> Result<()> {
+        let staged_len = std::fs::metadata(&archive_path).ok().map(|m| m.len());
+        if staged_len != Some(meta.len()) {
+            std::fs::create_dir_all(archive_path.parent().expect("hash dir has a parent"))?;
+            // Remove first: the stale entry may be a hardlink to the caller's file,
+            // and linking onto an existing path fails.
+            let _ = std::fs::remove_file(&archive_path);
+            link_or_copy(path, &archive_path, observer)?;
+        } else {
+            observer.emit(Phase::ArchiveStage, Mark::Hit);
+        }
+        Ok(())
+    })?;
     Ok(hash)
 }
 
 /// Stream stdin to a temp file (hashing as we go), then place it at
 /// `cache/<hash>/`. Single-pass, so one write is unavoidable.
-fn stage_from_stdin(cache_base: &Path) -> Result<String> {
+fn stage_from_stdin(cache_base: &Path, observer: &Observer) -> Result<String> {
     let mut tmp = tempfile::NamedTempFile::new_in(cache_base)?;
     let mut hasher = Sha256::new();
     let mut stdin = std::io::stdin().lock();
     let mut buf = vec![0u8; COPY_CHUNK];
     let mut total: u64 = 0;
-    loop {
-        let n = stdin.read(&mut buf)?;
-        if n == 0 {
-            break;
+    observer.around(Phase::ArchiveHash, || -> Result<()> {
+        loop {
+            let n = stdin.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > max_archive_bytes() {
+                return Err(too_large(total));
+            }
+            hasher.update(&buf[..n]);
+            tmp.write_all(&buf[..n])?;
         }
-        total += n as u64;
-        if total > max_archive_bytes() {
-            return Err(too_large(total));
-        }
-        hasher.update(&buf[..n]);
-        tmp.write_all(&buf[..n])?;
-    }
-    tmp.flush()?;
+        tmp.flush()?;
+        Ok(())
+    })?;
     let hash = hex::encode(hasher.finalize());
     let archive_path = cache_base.join(&hash).join(ARCHIVE_FILE);
     // Same validation as the file path: an entry staged earlier may have been
     // truncated through a hardlink to the original archive, and reusing it
     // would fail the boot with a misleading "manifest.json not found in tar".
-    if std::fs::metadata(&archive_path).is_ok_and(|m| m.len() == total) {
-        return Ok(hash); // already staged; the temp file is dropped/removed
-    }
-    let _ = std::fs::remove_file(&archive_path);
-    std::fs::create_dir_all(archive_path.parent().expect("hash dir has a parent"))?;
-    tmp.persist(&archive_path)
-        .map_err(|e| Error::storage("stage stdin archive", e.to_string()))?;
+    observer.around(Phase::ArchiveStage, || -> Result<()> {
+        if std::fs::metadata(&archive_path).is_ok_and(|m| m.len() == total) {
+            observer.emit(Phase::ArchiveStage, Mark::Hit);
+            return Ok(()); // already staged; the temp file is dropped/removed
+        }
+        let _ = std::fs::remove_file(&archive_path);
+        std::fs::create_dir_all(archive_path.parent().expect("hash dir has a parent"))?;
+        tmp.persist(&archive_path)
+            .map_err(|e| Error::storage("stage stdin archive", e.to_string()))?;
+        observer.emit(Phase::ArchiveStage, Mark::Copied);
+        Ok(())
+    })?;
     Ok(hash)
 }
 
@@ -343,11 +370,13 @@ fn hash_file(path: &Path) -> Result<String> {
 }
 
 /// Hardlink `src` into the cache, copying as a fallback across filesystems.
-fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
+fn link_or_copy(src: &Path, dst: &Path, observer: &Observer) -> Result<()> {
     if std::fs::hard_link(src, dst).is_ok() {
+        observer.emit(Phase::ArchiveStage, Mark::Linked);
         return Ok(());
     }
     std::fs::copy(src, dst)?;
+    observer.emit(Phase::ArchiveStage, Mark::Copied);
     Ok(())
 }
 
@@ -527,6 +556,84 @@ fn too_large(bytes: u64) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observed_staging_distinguishes_actual_link_and_cache_hit_without_changing_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.tar");
+        let cache = root.path().join("cache");
+        std::fs::write(&source, b"synthetic archive bytes").unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let observer = Observer::new(move |event| captured.lock().unwrap().push(event));
+        let first = stage_file(&source, &cache, &observer).unwrap();
+        let second = stage_file(&source, &cache, &observer).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            std::fs::read(cache.join(first).join(ARCHIVE_FILE)).unwrap(),
+            b"synthetic archive bytes"
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.phase, event.mark))
+                .collect::<Vec<_>>(),
+            [
+                (Phase::ArchiveHash, Mark::Started),
+                (Phase::ArchiveHash, Mark::Completed),
+                (Phase::ArchiveStage, Mark::Started),
+                (Phase::ArchiveStage, Mark::Linked),
+                (Phase::ArchiveStage, Mark::Completed),
+                (Phase::ArchiveHash, Mark::Started),
+                (Phase::ArchiveHash, Mark::Completed),
+                (Phase::ArchiveStage, Mark::Started),
+                (Phase::ArchiveStage, Mark::Hit),
+                (Phase::ArchiveStage, Mark::Completed),
+            ]
+        );
+    }
+
+    #[test]
+    fn observed_copy_fallback_reports_only_after_the_copy_succeeds() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        std::fs::write(&source, b"new bytes").unwrap();
+        std::fs::write(&target, b"old bytes").unwrap();
+        // Existing destination makes hardlink fail, exercising the ordinary copy fallback.
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let observer = Observer::new(move |event| captured.lock().unwrap().push(event));
+        link_or_copy(&source, &target, &observer).unwrap();
+        assert_eq!(std::fs::read(target).unwrap(), b"new bytes");
+        assert_eq!(
+            *events.lock().unwrap(),
+            [crate::progress::Event {
+                phase: Phase::ArchiveStage,
+                mark: Mark::Copied
+            }]
+        );
+    }
+
+    #[test]
+    fn observed_resolution_keeps_refusal_details_out_of_callback_events() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let observer = Observer::new(move |event| captured.lock().unwrap().push(event));
+        let result = resolve_observed(
+            ImageSource::Unsupported {
+                given: "private-input-canary".into(),
+                hint: "use an archive".into(),
+            },
+            &observer,
+        );
+        assert!(result.is_err());
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].mark, Mark::Failed);
+        assert!(!format!("{events:?}").contains("canary"));
+    }
 
     #[test]
     fn only_a_staged_archive_reference_has_an_archive_key() {

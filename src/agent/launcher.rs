@@ -256,6 +256,8 @@ pub fn create_disk_overlays(specs: &[DiskOverlaySpec]) -> Result<()> {
 /// on manager/launcher functions.
 #[derive(Debug, Clone, Default)]
 pub struct LaunchFeatures {
+    /// Explicit host-only observer, never serialized into the guest boot configuration.
+    pub observer: crate::progress::Observer,
     /// Explicitly restore a paused machine; never permit a silent cold boot.
     pub resume_paused: bool,
     /// Host SSH agent socket path for forwarding into the guest.
