@@ -7,6 +7,27 @@ one matching helper, library directory and rootfs bundle before starting machine
 The registry, image cache and rootfs/template discovery use one process-wide data
 root. Set that root before starting threads, not around individual launches.
 
+## Interactive image commands
+
+`EmbeddedRuntime::exec_interactive` opens a dedicated channel-driven PTY on an
+already-started or explicitly connected image machine. It uses the machine's
+persistent workload overlay and mounts and honors the requested user and directory.
+It never starts or resumes a stopped machine and rejects bare-VM targets. The
+caller supplies a bounded `interactive_input` channel and consumes output directly;
+no host terminal or process-wide stdin/stdout is touched. Resize events change the
+guest PTY dimensions. `InteractiveInput::Cancel` closes the connection's write
+half and retains reads until the guest kills/reaps the command tree and returns
+`Exited`. Cancellation waits at most five seconds for that receipt. Lost input or
+transport is an error, not a synthetic numeric exit; callers retaining writer
+custody can therefore keep uncertainty after disconnect. Ordinary channel-driven
+API sessions retain their existing best-effort behavior on channel loss.
+Startup waits at most five seconds for `Started` and emits that actual receipt as
+`InteractiveOutput::Started` before any command bytes; allocating a host input
+channel is not command readiness. An admitted shell has no idle read timeout.
+The operation uses the existing in-flight command boundary, so stopping the machine
+interrupts it. Per-command piped stdin and timeout options are rejected: the input
+channel and the caller's connection lifetime control this operation.
+
 ## Published sockets
 
 `MachineSpec::published_sockets` persists host/guest Unix-socket mappings. Both

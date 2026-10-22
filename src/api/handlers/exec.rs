@@ -829,6 +829,9 @@ pub(crate) async fn bridge_interactive<S, F>(
     // Pump session output -> WS. Ends when the session drops `out_tx` (command exit).
     while let Some(o) = out_rx.recv().await {
         let message = match o {
+            // The ordinary API input keeps its historical output shape; only
+            // strict embedded custody asks the client for this receipt.
+            InteractiveOutput::Started => continue,
             InteractiveOutput::Stdout(d) => Message::Binary(d.into()),
             // A PTY has one output stream, which the agent reports as stdout. On
             // pipes stderr is a stream of its own and must not join the bytes.

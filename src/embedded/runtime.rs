@@ -1071,6 +1071,45 @@ impl EmbeddedRuntime {
         op.finish(result)
     }
 
+    /// Execute an interactive image command over a dedicated, disposable connection.
+    ///
+    /// This never starts or resumes a machine. The caller must have started or
+    /// explicitly connected it first. The command shares the machine's workload
+    /// overlay and mounts, and honors its requested user. `InteractiveInput::Cancel`
+    /// waits for the guest's exit acknowledgement; losing every sender is an error,
+    /// not proof of cleanup. No host terminal is touched; input and output remain
+    /// transport-independent.
+    pub fn exec_interactive<F>(
+        &self,
+        name: &str,
+        command: Vec<String>,
+        options: ExecOptions,
+        input: crate::agent::InteractiveInputReceiver,
+        on_output: F,
+    ) -> Result<i32>
+    where
+        F: FnMut(crate::agent::InteractiveOutput),
+    {
+        if options.stdin.is_some() || options.timeout.is_some() {
+            return Err(Error::config(
+                "interactive exec",
+                "interactive commands use the input channel and its lifetime",
+            ));
+        }
+        let op = self.inflight.begin(name, "exec")?;
+        let result = (|| {
+            let options = self.with_machine_context(name, options)?;
+            let target = self.machine_target(name)?;
+            let config = self
+                .command_run_config(name, target, &command, &options)?
+                .ok_or_else(|| Error::config("interactive exec", "requires an image machine"))?;
+            let mut client = self.command_client(name)?;
+            let _startup = client.set_extended_read_timeout(Duration::from_secs(5))?;
+            client.run_interactive_io(config.with_tty(true), input.require_exit(), on_output)
+        })();
+        op.finish(result)
+    }
+
     /// Start a command and return its guest pid without waiting for it to
     /// finish: a server, a watcher or another long-lived process. It runs in
     /// the same filesystem as [`Self::exec_with_options`] and keeps running
@@ -1818,6 +1857,35 @@ mod tests {
         .is_ok());
         assert!(runtime.db.pending_resize_names().unwrap().is_empty());
         assert!(runtime.name_locks.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn interactive_exec_never_starts_a_stopped_image() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        let mut spec = test_spec("terminal", true);
+        spec.image = Some("synthetic:local".into());
+        runtime.create_machine(spec).unwrap();
+        let (_, input) = crate::agent::interactive_input(2).unwrap();
+        assert!(runtime
+            .exec_interactive(
+                "terminal",
+                vec!["/bin/sh".into()],
+                ExecOptions {
+                    user: Some("1000:1000".into()),
+                    ..Default::default()
+                },
+                input,
+                |_| {}
+            )
+            .is_err());
+        assert!(!runtime.is_running("terminal"));
+        assert!(runtime.cached_handle("terminal").unwrap().is_none());
+        assert!(runtime
+            .machine_record("terminal")
+            .unwrap()
+            .unwrap()
+            .pid
+            .is_none());
     }
 
     fn test_db() -> SmolvmDb {

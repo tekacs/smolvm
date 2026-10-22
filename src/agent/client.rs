@@ -73,11 +73,16 @@ pub enum InteractiveInput {
     },
     /// End of input — sends an empty stdin frame (EOF) to the command.
     Eof,
+    /// End this owned command and wait for the guest's Exited acknowledgement.
+    /// Unlike dropping input, this half-closes only writes and keeps reading.
+    Cancel,
 }
 
 /// One output chunk produced by a channel-driven interactive session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InteractiveOutput {
+    /// The guest admitted the command. Emitted by strict embedded sessions only.
+    Started,
     /// A chunk of bytes from the command's stdout.
     Stdout(Vec<u8>),
     /// A chunk of bytes from the command's stderr.
@@ -110,6 +115,7 @@ pub struct InteractiveInputSender {
 /// [`InteractiveInputSender`].
 pub struct InteractiveInputReceiver {
     rx: tokio::sync::mpsc::Receiver<InteractiveInput>,
+    ack: bool,
     #[cfg(unix)]
     wake: UdsStream,
 }
@@ -134,6 +140,7 @@ pub fn interactive_input(
             },
             InteractiveInputReceiver {
                 rx,
+                ack: false,
                 wake: receiver_end,
             },
         ))
@@ -142,7 +149,7 @@ pub fn interactive_input(
     {
         Ok((
             InteractiveInputSender { tx },
-            InteractiveInputReceiver { rx },
+            InteractiveInputReceiver { rx, ack: false },
         ))
     }
 }
@@ -160,6 +167,12 @@ impl InteractiveInputSender {
 }
 
 impl InteractiveInputReceiver {
+    /// Embedded command custody cannot treat a disconnected input as an exit ACK.
+    pub(crate) fn require_exit(mut self) -> Self {
+        self.ack = true;
+        self
+    }
+
     /// The descriptor that becomes readable when input may be waiting, or -1
     /// where sessions are not wired up (non-Unix hosts).
     fn wake_fd(&self) -> crate::agent::terminal::Fd {
@@ -2879,12 +2892,13 @@ impl AgentClient {
     {
         use crate::agent::terminal::poll_io;
 
-        // No socket read timeout — the poll loop handles readiness and the
-        // session runs until the command exits or the peer hangs up.
-        self.stream
-            .set_read_timeout(None)
-            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
-
+        // Strict custody preserves the connection's startup bound until Started.
+        // Ordinary API sessions retain their historical unbounded startup read.
+        if !input.ack {
+            self.stream
+                .set_read_timeout(None)
+                .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
+        }
         self.send(&request)?;
         match self.receive()? {
             AgentResponse::Started => {}
@@ -2892,23 +2906,40 @@ impl AgentClient {
             _ => return Err(Error::agent(op, "expected Started response")),
         }
 
+        self.stream
+            .set_read_timeout(None)
+            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
+        if input.ack {
+            on_output(InteractiveOutput::Started);
+        }
         let socket_fd = self.stream_raw_fd();
         let mut wake_fd = input.wake_fd();
         let mut input_eof_sent = false;
 
         // Route channel input through the same writer as `interactive_session`.
-        let writer = FrameWriter::spawn(&self.stream)?;
+        let mut writer = Some(FrameWriter::spawn(&self.stream)?);
         let mut pending: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+        let mut closing: Option<std::time::Instant> = None;
 
         let exit_code = loop {
-            if let Some(e) = writer.take_error() {
-                return Err(Error::agent(op, format!("failed to send to agent: {}", e)));
+            if closing.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(Error::agent(op, "command cleanup was not acknowledged"));
             }
-            pump_frames(&writer, &mut pending)?;
+            if let Some(writer) = &writer {
+                if let Some(e) = writer.take_error() {
+                    return Err(Error::agent(op, format!("failed to send to agent: {}", e)));
+                }
+                pump_frames(writer, &mut pending)?;
+            }
 
             // The wake-up descriptor stands where a terminal's stdin would: input
             // arriving on the channel interrupts the wait. -1 is ignored by poll().
-            let poll_timeout = if pending.is_empty() {
+            let poll_timeout = if let Some(deadline) = closing {
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis()
+                    .min(POLL_TIMEOUT_MS as u128) as i32
+            } else if pending.is_empty() {
                 poll_timeout_ms
             } else {
                 BACKPRESSURE_POLL_TIMEOUT_MS
@@ -2956,7 +2987,7 @@ impl AgentClient {
             // Forward any pending input without blocking the output path. While
             // the writer queue is backed up the events stay in their source
             // channel, so backpressure composes instead of buffering here.
-            while pending.is_empty() {
+            while pending.is_empty() && closing.is_none() {
                 match input.try_recv() {
                     Ok(InteractiveInput::Stdin(data)) => {
                         pending.push_back(self.encode_traced(&AgentRequest::Stdin { data })?)
@@ -2972,8 +3003,25 @@ impl AgentClient {
                             input_eof_sent = true;
                         }
                     }
+                    Ok(InteractiveInput::Cancel) => {
+                        // The guest already treats read EOF as owned-command
+                        // cancellation, reaps it, then writes Exited. Preserve the
+                        // read half to distinguish that receipt from a lost peer.
+                        drop(writer.take());
+                        self.stream
+                            .shutdown(std::net::Shutdown::Write)
+                            .map_err(|e| Error::agent(op, e.to_string()))?;
+                        self.stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .map_err(|e| Error::agent(op, e.to_string()))?;
+                        closing = Some(std::time::Instant::now() + Duration::from_secs(5));
+                        wake_fd = -1;
+                    }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        if input.ack {
+                            return Err(Error::agent(op, "command cleanup was not acknowledged"));
+                        }
                         // Remote peer (WebSocket client) gone. Return immediately
                         // instead of waiting for the command to exit on its own.
                         // This method runs on a DEDICATED, disposable connection,
@@ -2987,7 +3035,9 @@ impl AgentClient {
                 }
                 // Hand the event straight on, so a writer that is keeping up
                 // leaves `pending` empty and this keeps draining the channel.
-                pump_frames(&writer, &mut pending)?;
+                if let Some(writer) = &writer {
+                    pump_frames(writer, &mut pending)?;
+                }
             }
         };
 
@@ -5799,6 +5849,8 @@ mod interactive_input_tests {
         // The guest sees its connection close and kills the command.
         guest.finish();
     }
+
+    mod cancel;
 
     #[test]
     fn a_long_stream_of_input_arrives_intact_under_backpressure() {
