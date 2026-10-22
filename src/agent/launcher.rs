@@ -719,6 +719,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     let _ = &pod_net;
 
+    crate::config::PublishedSocketConfig::validate(published_sockets)?;
     crate::network::validate_requested_network_backend(
         resources,
         egress_refresh_hosts.as_deref(),
@@ -1873,70 +1874,43 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // The per-VM dir (the vsock socket's parent) is where an `expose` socket's
         // host end is created when the user didn't pin a host path.
         let per_vm_dir = vsock_socket.parent();
-        let published_guest: Vec<smolvm_protocol::publish_socket::PublishedSocket> = published_sockets
-            .iter()
-            .take(ports::PUBLISH_SOCKET_MAX)
-            .enumerate()
-            .filter_map(|(i, spec)| {
-                let vsock_port = ports::PUBLISH_SOCKET_BASE + i as u32;
-                // Resolve the host-side path: explicit, or (expose only) the
-                // per-VM dir + the guest socket's basename.
-                let host_path: std::path::PathBuf = match &spec.host_path {
-                    Some(p) => std::path::PathBuf::from(p),
-                    None => {
-                        let base = std::path::Path::new(&spec.guest_path)
-                            .file_name()
-                            .unwrap_or_else(|| std::ffi::OsStr::new("published.sock"));
-                        match per_vm_dir {
-                            Some(dir) => dir.join(base),
-                            None => {
-                                tracing::warn!(
-                                    guest_path = %spec.guest_path,
-                                    "published socket has no host path and no per-VM dir; skipping"
-                                );
-                                return None;
-                            }
-                        }
-                    }
-                };
-                // For an expose socket libkrun *creates* the host listener, so
-                // clear any stale file first (mirrors the Docker bridge).
-                if spec.direction.host_listens() {
-                    if let Err(e) = super::launcher_dynamic::check_socket_path_len(&host_path) {
-                        tracing::warn!(guest_path = %spec.guest_path, "published socket skipped: {e}");
-                        return None;
-                    }
-                    let _ = std::fs::remove_file(&host_path);
-                }
-                let host_c = match path_to_cstring(&host_path) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        tracing::warn!(host_path = %host_path.display(), "published socket host path has a null byte; skipping");
-                        return None;
-                    }
-                };
-                if krun_add_vsock_port2(ctx, vsock_port, host_c.as_ptr(), spec.direction.host_listens()) < 0 {
-                    tracing::warn!(
+        let published_guest: Result<Vec<smolvm_protocol::publish_socket::PublishedSocket>> =
+            published_sockets
+                .iter()
+                .enumerate()
+                .map(|(i, spec)| {
+                    let vsock_port = ports::PUBLISH_SOCKET_BASE + i as u32;
+                    let host_path = spec.resolve(per_vm_dir)?;
+                    let host_c = path_to_cstring(&host_path)?;
+                    if krun_add_vsock_port2(
+                        ctx,
                         vsock_port,
-                        host_path = %host_path.display(),
-                        "failed to add published socket vsock port — disabled"
+                        host_c.as_ptr(),
+                        spec.direction.host_listens(),
+                    ) < 0
+                    {
+                        return Err(Error::config(
+                            "publish-socket",
+                            "failed to register socket bridge",
+                        ));
+                    }
+                    tracing::info!(
+                        vsock_port,
+                        direction = spec.direction.as_str(),
+                        "published socket bridge enabled"
                     );
-                    return None;
-                }
-                tracing::info!(
-                    vsock_port,
-                    direction = spec.direction.as_str(),
-                    host_path = %host_path.display(),
-                    guest_path = %spec.guest_path,
-                    "published socket bridge enabled"
-                );
-                Some(smolvm_protocol::publish_socket::PublishedSocket {
-                    vsock_port,
-                    guest_path: spec.guest_path.clone(),
-                    direction: spec.direction,
+                    Ok(smolvm_protocol::publish_socket::PublishedSocket {
+                        vsock_port,
+                        guest_path: spec.guest_path.clone(),
+                        direction: spec.direction,
+                    })
                 })
-            })
-            .collect();
+                .collect();
+        let published_guest = try_or_free_ctx!(
+            published_guest,
+            "publish sockets",
+            "socket bridge registration failed"
+        );
 
         // Redirect console output to a file if specified, via the upstream
         // virtio-console API (krun_set_console_output was removed).

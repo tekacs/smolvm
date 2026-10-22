@@ -3005,6 +3005,7 @@ impl AgentManager {
         let watch_parent = features.watch_parent.unwrap_or(boot_binary.is_some());
         let boot_exe = boot_binary.unwrap_or_else(|| exe.clone());
         let mut cmd = std::process::Command::new(&boot_exe);
+        crate::embedded::bundle::configure(&mut cmd);
         if let Some(service) = crate::network::launch::guest_host_service()
             .map_err(|reason| Error::config("configure guest rollout ingress", reason))?
         {
@@ -3043,7 +3044,7 @@ impl AgentManager {
             } else {
                 "LD_LIBRARY_PATH"
             };
-            if let Some(existing) = std::env::var_os(var) {
+            if let Some(existing) = crate::embedded::bundle::boot_var(var) {
                 if !existing.is_empty() {
                     search.push(std::path::PathBuf::from(existing));
                 }
@@ -3087,7 +3088,7 @@ impl AgentManager {
         // flag looks like it does nothing at all. Write to `boot-debug.log` beside
         // the VM's boot config there instead; every other platform still inherits.
         {
-            let boot_debug = std::env::var_os("SMOLVM_BOOT_DEBUG").is_some();
+            let boot_debug = crate::embedded::bundle::boot_var("SMOLVM_BOOT_DEBUG").is_some();
             let debug_log = if cfg!(windows) && boot_debug {
                 config_path.parent().map(|dir| dir.join("boot-debug.log"))
             } else {
@@ -3178,7 +3179,7 @@ impl AgentManager {
         #[cfg(target_os = "linux")]
         let mut adopted_scope = None;
         #[cfg(target_os = "linux")]
-        if std::env::var_os("SMOLVM_VM_USE_SCOPE").is_some() {
+        if crate::embedded::bundle::boot_var("SMOLVM_VM_USE_SCOPE").is_some() {
             if let Some(name) = self.name() {
                 let budget = crate::process::vmm_memory_budget(
                     resources_for_config.memory_mib,

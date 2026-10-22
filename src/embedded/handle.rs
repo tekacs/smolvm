@@ -116,8 +116,9 @@ impl VmHandle {
         }
     }
 
-    /// Let a CLI-started VM outlive the process that launched it.
-    pub fn detach(self) {
+    /// Let the VM outlive this handle and the process that launched it.
+    /// Explicit stop remains available on a retained detached handle.
+    pub fn detach(&self) {
         self.manager.detach();
     }
 }

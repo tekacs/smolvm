@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 pub use smolvm_protocol::publish_socket::SocketDirection;
 use std::collections::BTreeMap;
 
+mod sockets;
+
 /// A user-published host↔guest Unix-socket bridge (`--expose-socket` /
 /// `--mount-socket`), persisted on the VM record. The vsock port is assigned at
 /// launch (not stored); only the paths and direction are durable.

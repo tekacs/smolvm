@@ -245,7 +245,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         // If the supervisor delegated a cgroup v2 root (via SMOLVM_CGROUP_ROOT),
         // place this VMM in a per-VM cgroup with cpu/pids/memory caps so an untrusted
         // guest can't peg host CPU, fork-bomb the host, or balloon VMM memory. Inert
-        // when the env var is unset (no delegation) — never blocks boot.
+        // when unset. When requested, any missing limit or membership aborts boot.
         #[cfg(target_os = "linux")]
         if let Some(cgroup_root) = std::env::var_os("SMOLVM_CGROUP_ROOT") {
             crate::process::place_in_cgroup(
@@ -256,7 +256,8 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
                 // Match scope-mode accounting for both sources and restored clones.
                 std::env::var_os("SMOLVM_FORKABLE").is_some()
                     || std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some(),
-            );
+            )
+            .map_err(|error| crate::Error::agent("place VM cgroup", error.to_string()))?;
         }
     }
 

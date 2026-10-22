@@ -22,6 +22,8 @@ pub struct MachineSpec {
     pub mounts: Vec<HostMount>,
     /// Host-to-guest port mappings.
     pub ports: Vec<PortMapping>,
+    /// Published Unix sockets; persisted and restored on every launch.
+    pub published_sockets: Vec<crate::config::PublishedSocketConfig>,
     /// VM resources for this machine.
     pub resources: VmResources,
     /// OCI image the machine boots from, when it is an image machine rather than
@@ -87,6 +89,7 @@ impl MachineSpec {
             self.resources.network,
         );
         record.set_port_mappings(&self.ports);
+        record.published_sockets = self.published_sockets.clone();
         record.staged_mounts = staged_mounts;
         record.storage_gb = self.resources.storage_gib;
         record.overlay_gb = self.resources.overlay_gib;
@@ -143,6 +146,7 @@ pub(crate) fn create_vm_with_workload(
     }
     PortMapping::check_duplicates(&spec.ports)
         .map_err(|reason| Error::config("validate published ports", reason))?;
+    crate::config::PublishedSocketConfig::validate(&spec.published_sockets)?;
     let mut record = spec.to_record();
     if let Some(policy) = credentials.filter(|p| !p.is_empty()) {
         // A credential only ever travels over the network the machine has; it
@@ -270,8 +274,7 @@ pub(crate) fn start_vm_with_interceptor(
             ..Default::default()
         },
     )?;
-    mark_running(db, name, started.handle.child_pid())?;
-    Ok(started)
+    started.persist(db, &record)
 }
 
 pub(crate) fn resume_vm(db: &SmolvmDb, name: &str, detached: bool) -> Result<StartedVm> {
@@ -300,10 +303,14 @@ pub(crate) fn resume_vm(db: &SmolvmDb, name: &str, detached: bool) -> Result<Sta
         record.paused_checkpoint = None;
     })?
     .ok_or_else(|| Error::vm_not_found(name))?;
+    if detached || record.detached {
+        started.handle.detach();
+    }
     Ok(started)
 }
 
 fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures) -> LaunchFeatures {
+    features.published_sockets = record.published_sockets.clone();
     if features.dns_filter_hosts.is_none() {
         features.dns_filter_hosts = record.dns_filter_hosts.clone();
     }
@@ -322,6 +329,7 @@ fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures)
 }
 
 fn record_launch_features(record: &VmRecord, features: LaunchFeatures) -> Result<LaunchFeatures> {
+    crate::config::PublishedSocketConfig::validate(&record.published_sockets)?;
     let mut features = merge_record_launch_features(record, features)
         .with_packed_layers_with_mode(
             &crate::agent::machine_layers_cache_dir(&record.name),
@@ -341,6 +349,16 @@ fn record_launch_features(record: &VmRecord, features: LaunchFeatures) -> Result
 pub(crate) struct StartedVm {
     pub(crate) handle: VmHandle,
     pub(crate) freshly_started: bool,
+}
+
+impl StartedVm {
+    fn persist(self, db: &SmolvmDb, record: &VmRecord) -> Result<Self> {
+        mark_running(db, &record.name, self.handle.child_pid())?;
+        if record.detached {
+            self.handle.detach();
+        }
+        Ok(self)
+    }
 }
 
 /// Boot `record` with the given launch features and return a handle. Shared by
@@ -434,9 +452,7 @@ pub(crate) fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> 
         forkable: true,
         ..LaunchFeatures::default()
     };
-    let started = launch_from_record(&record, features)?;
-    mark_running(db, name, started.handle.child_pid())?;
-    Ok(started)
+    launch_from_record(&record, features)?.persist(db, &record)
 }
 
 /// Start a persisted VM attached to a Kubernetes pod network namespace: the
@@ -454,8 +470,7 @@ pub fn start_vm_with_netns(
         pod_netns: Some(netns),
         ..LaunchFeatures::default()
     };
-    let started = launch_from_record(&record, features)?;
-    mark_running(db, name, started.handle.child_pid())?;
+    let started = launch_from_record(&record, features)?.persist(db, &record)?;
     Ok(started.handle)
 }
 
@@ -545,6 +560,9 @@ fn boot_prepared_fork(
             if let Err(error) = mark_running(db, clone, handle.child_pid()) {
                 let _ = handle.stop();
                 return Err(error);
+            }
+            if !watch_parent.unwrap_or(!prep.clone_record.detached) {
+                handle.detach();
             }
             Ok(handle)
         })()
@@ -742,6 +760,10 @@ pub fn connect_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
+    // A failed attach must not kill a detached VM when its temporary manager drops.
+    if record.detached {
+        manager.detach();
+    }
     if manager.try_connect_existing().is_none() {
         return Err(Error::agent_not_found(
             "connect machine",
@@ -897,6 +919,10 @@ pub fn mark_stopped(db: &SmolvmDb, name: &str) -> Result<()> {
     .ok_or_else(|| Error::vm_not_found(name))?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "control/sockets.rs"]
+mod sockets;
 
 #[cfg(test)]
 mod tests {

@@ -12,7 +12,10 @@
 //! branch made from a Python script booted with the SDK's helper, which arms a parent-death
 //! watchdog and exits as soon as the CLI that spawned it returns. The machine died within
 //! seconds, and the SDK's bundled libraries and agent rootfs shadowed the CLI's own.
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::OnceLock;
 
 /// What an embedder bundles. Every field is optional: a missing one falls back to the
@@ -25,6 +28,39 @@ pub struct Bundle {
     pub lib_dir: Option<PathBuf>,
     /// Guest agent rootfs as a tarball, extracted on first use.
     pub agent_rootfs_tar: Option<PathBuf>,
+    /// Explicit helper environment. `None` inherits; `Some` clears ambient values.
+    /// This is host process configuration, never persisted in the VM registry.
+    pub boot_env: Option<BTreeMap<OsString, OsString>>,
+}
+
+impl Bundle {
+    fn configure(&self, command: &mut Command) {
+        if let Some(env) = &self.boot_env {
+            command.env_clear().envs(env);
+        }
+    }
+
+    fn variable(&self, name: &str) -> Option<OsString> {
+        match &self.boot_env {
+            Some(env) => env.get(std::ffi::OsStr::new(name)).cloned(),
+            None => std::env::var_os(name),
+        }
+    }
+}
+
+/// Apply explicit environment policy before adding intentional per-launch values.
+pub(crate) fn configure(command: &mut Command) {
+    if let Some(bundle) = bundle() {
+        bundle.configure(command);
+    }
+}
+
+/// Read a boot setting without falling back to ambient values in explicit mode.
+pub(crate) fn boot_var(name: &str) -> Option<OsString> {
+    match bundle() {
+        Some(bundle) => bundle.variable(name),
+        None => std::env::var_os(name),
+    }
 }
 
 static BUNDLE: OnceLock<Bundle> = OnceLock::new();
@@ -55,9 +91,7 @@ pub fn bundle() -> Option<&'static Bundle> {
 }
 
 fn env_path(var: &str) -> Option<PathBuf> {
-    std::env::var_os(var)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
+    boot_var(var).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 /// The boot helper to spawn: the embedder's, else `SMOLVM_BOOT_BINARY`, else none (spawn self).
@@ -86,11 +120,48 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
+    fn explicit_boot_environment_clears_all_ambient_and_preexisting_values() {
+        let explicit = Bundle {
+            boot_env: Some(BTreeMap::from([("ONLY".into(), "allowed".into())])),
+            ..Default::default()
+        };
+        let mut child = Command::new("/usr/bin/env");
+        child.env("SYNTHETIC_SECRET", "must-not-cross");
+        explicit.configure(&mut child);
+        let output = child.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ONLY=allowed\n");
+        assert_eq!(explicit.variable("ONLY"), Some("allowed".into()));
+        assert_eq!(explicit.variable("HOME"), None);
+        assert_eq!(explicit.variable("LD_LIBRARY_PATH"), None);
+
+        let empty = Bundle {
+            boot_env: Some(BTreeMap::new()),
+            ..Default::default()
+        };
+        let mut child = Command::new("/usr/bin/env");
+        empty.configure(&mut child);
+        assert!(child.output().unwrap().stdout.is_empty());
+    }
+
+    #[test]
+    fn absent_environment_policy_preserves_explicit_command_values() {
+        let mut child = Command::new("unused");
+        child.env("SELECTED", "value");
+        Bundle::default().configure(&mut child);
+        assert!(child.get_envs().any(
+            |(name, value)| name == "SELECTED" && value == Some(std::ffi::OsStr::new("value"))
+        ));
+    }
+
+    #[test]
     fn a_second_identical_bundle_is_accepted_and_a_different_one_is_refused() {
         let b = Bundle {
             boot_binary: Some(PathBuf::from("/pkg/smol-vmm")),
             lib_dir: Some(PathBuf::from("/pkg")),
             agent_rootfs_tar: None,
+            ..Default::default()
         };
         // Whatever another test registered first, registering the same thing twice must be fine
         // and registering something else must be refused rather than silently ignored.
