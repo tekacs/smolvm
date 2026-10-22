@@ -4,16 +4,25 @@ use super::*;
 /// Preparation policy. Credentials are borrowed and deliberately not Debug/Serialize.
 #[derive(Clone, Copy)]
 pub struct SeedSpec<'a> {
+    /// Matched smolvm helper executable used when a seed must be built.
     pub exe: &'a Path,
+    /// Registry image reference or engine-resolved local archive reference.
     pub image: &'a str,
+    /// Registry pull credentials; local archive preparation does not use them.
     pub auth: &'a PullAuth,
+    /// Requested disk size in GiB; sizes below the default require a matching seed.
     pub storage_gb: Option<u64>,
+    /// Maximum cached registry digest age in seconds; None disables digest reuse.
     pub digest_ttl: Option<u64>,
+    /// Explicit proxy URL passed to registry resolution and the builder.
     pub proxy: Option<&'a str>,
+    /// Proxy bypass list passed to registry resolution and the builder.
     pub no_proxy: Option<&'a str>,
+    /// Whether the builder trusts the host certificate bundle.
     pub trust_host_certs: bool,
 }
 impl<'a> SeedSpec<'a> {
+    /// Use default storage, no digest reuse or explicit proxy, and no host CA trust.
     pub fn new(exe: &'a Path, image: &'a str, auth: &'a PullAuth) -> Self {
         Self {
             exe,
@@ -32,6 +41,7 @@ pub struct SeedId {
     pub(super) seed: EnsuredSeed,
 }
 impl SeedId {
+    /// Return the engine's opaque cache key for this leased seed.
     pub fn key(&self) -> &str {
         self.seed
             .key_dir
