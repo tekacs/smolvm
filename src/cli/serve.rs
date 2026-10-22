@@ -1306,12 +1306,37 @@ mod tests {
         assert!(super::bind_private_unix_socket(&path).is_err());
         assert!(std::fs::metadata(&path).unwrap().file_type().is_socket());
         drop(active);
-        let (guard, _listener) = super::bind_private_unix_socket(&path).unwrap();
+        // Another parallel test can fork while `active` is open. Dropping our
+        // handle does not prove its inherited aliases are closed. Build the
+        // stale fixture in a separate process, then join its actual exit.
+        let stale = dir.path().join("stale.sock");
+        assert!(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cli::serve::tests::stale_api_child", "--ignored"])
+            .env("SMOLVM_TEST_STALE_SOCKET", &stale)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::fs::symlink_metadata(&stale)
+            .unwrap()
+            .file_type()
+            .is_socket());
+        let (guard, _listener) = super::bind_private_unix_socket(&stale).unwrap();
         assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&stale).unwrap().permissions().mode() & 0o777,
             0o600
         );
         drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "private subprocess entrypoint for stale socket construction"]
+    fn stale_api_child() {
+        let path = std::env::var_os("SMOLVM_TEST_STALE_SOCKET").expect("explicit fixture path");
+        let _listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::process::exit(0);
     }
 
     /// `/slow` answers after `delay`, signalling `entered` as it starts, so a
