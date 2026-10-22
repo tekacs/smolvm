@@ -15,6 +15,10 @@
 //! - everything else (`alpine`, `repo:tag`, `ghcr.io/owner/repo@sha256:…`) → a
 //!   registry reference, even if a same-named file happens to sit in the cwd.
 
+/// Descriptor-pinned reuse of explicitly published read-only archives.
+#[cfg(unix)]
+pub mod prepared;
+
 use crate::{
     progress::{Mark, Observer, Phase},
     Error, Result,
@@ -356,7 +360,10 @@ fn stage_from_stdin(cache_base: &Path, observer: &Observer) -> Result<String> {
 }
 
 fn hash_file(path: &Path) -> Result<String> {
-    let mut file = std::fs::File::open(path)?;
+    hash_reader(std::fs::File::open(path)?)
+}
+
+fn hash_reader(mut file: impl Read) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; COPY_CHUNK];
     loop {

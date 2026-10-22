@@ -1123,35 +1123,8 @@ fn remember_verification(artifact: &Path, verified: &VerifiedSidecar) {
     remembered.push((verified.identity, verified.footer));
 }
 
-/// The exact inode a verification read, as the kernel reports it. `ctime` is
-/// kernel-maintained and moves on every content write, relink, unlink or
-/// timestamp change, so an equal identity means the same unchanged bytes.
 #[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SidecarIdentity {
-    dev: u64,
-    ino: u64,
-    len: u64,
-    mtime: (i64, i64),
-    ctime: (i64, i64),
-}
-
-#[cfg(unix)]
-impl SidecarIdentity {
-    fn of(file: &std::fs::File) -> Result<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = file
-            .metadata()
-            .map_err(|error| Error::agent("inspect checkpoint artifact", error.to_string()))?;
-        Ok(Self {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-            len: metadata.len(),
-            mtime: (metadata.mtime(), metadata.mtime_nsec()),
-            ctime: (metadata.ctime(), metadata.ctime_nsec()),
-        })
-    }
-}
+use crate::file_identity::Identity as SidecarIdentity;
 
 /// A single-file artifact whose footer checksum was verified through a
 /// descriptor the holder keeps open, pinning the very inode that was read.

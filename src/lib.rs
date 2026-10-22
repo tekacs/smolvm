@@ -92,6 +92,8 @@ pub mod dns_filter_listener;
 pub mod docker_config;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
+#[cfg(unix)]
+mod file_identity;
 pub mod image_seed;
 pub mod image_store;
 /// Boots a VM from a written boot-config: the `_boot-vm` subprocess entry point.
